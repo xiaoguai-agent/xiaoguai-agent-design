@@ -1,0 +1,7 @@
+# 不提交大二进制原文（参考资料用，不是文档源）
+*.docx
+
+# OS / IDE
+.DS_Store
+.vscode/
+.idea/

@@ -1,0 +1,543 @@
+# HLD — Xiaoguai v1.4 (retrofit)
+
+| | |
+|---|---|
+| Document ID | `HLD-XIAOGUAI-001` |
+| Type | High-Level Design |
+| Status | `draft` |
+| Author | Zhou Wei |
+| Source | [`PRD-XIAOGUAI-001`](prd-xiaoguai.md), [`API-XIAOGUAI-001`](api-contract.md), implementation repo |
+| Updated | 2026-05-28 |
+
+> **Retrofit notice.** This HLD describes the architecture as it exists at v1.4.0. ADR identifiers (`ADR-0001`…`ADR-0018`) refer to records in the implementation repo `docs/architecture/adr/`.
+
+> **Philosophy.** The design rationale behind everything below — the R.E.S.T product goals (Reliability, Efficiency, Security, Traceability), the harness-as-REPL-container abstraction, the control-plane/data-plane split, and the six design principles we negotiate trade-offs against — lives in [`harness-engineering.md`](harness-engineering.md). Read that doc first if you are new to the project; it gives you the vocabulary to read this one.
+
+---
+
+## 1. System context
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│                              External actors                              │
+│   end users   tenant admins   operators   IM platforms   curated catalog  │
+└──────┬──────────┬─────────────┬──────────────┬───────────────┬───────────┘
+       │ chat-ui  │ admin-ui    │ CLI / API    │ webhook+WS    │ skill pack
+       ▼          ▼             ▼              ▼               ▼
+┌──────────────────────────────────────────────────────────────────────────┐
+│                            xiaoguai (binary)                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐  │
+│  │  Edge:  HTTP/SSE (axum, /v1/**)  ·  CLI (clap)  ·  IM gateways      │  │
+│  └─────────────────────────────────────────────────────────────────────┘  │
+│  ┌─────────────────────────────────────────────────────────────────────┐  │
+│  │  Agent runtime:  ReAct loop → HotL gate → parallel tool dispatch    │  │
+│  │  Orchestrator (multi-agent)  ·  Personas (role presets)              │  │
+│  └─────────────────────────────────────────────────────────────────────┘  │
+│  ┌──────────────┬──────────────┬───────────────┬──────────────────────┐  │
+│  │ LLM router   │ MCP client + │ Memory + RAG  │ Scheduler / Watch /  │  │
+│  │ (8 providers)│ supervisor   │ (pgvector)    │ Anomaly              │  │
+│  └──────────────┴──────────────┴───────────────┴──────────────────────┘  │
+│  ┌─────────────────────────────────────────────────────────────────────┐  │
+│  │  Cross-cutting:  Auth (OIDC + Casbin + RLS)  ·  Audit (HMAC chain)   │  │
+│  │                  Observability (OTel + Prometheus, both PII-redacted)│  │
+│  └─────────────────────────────────────────────────────────────────────┘  │
+└─────┬────────────────────────────┬────────────────────┬──────────────────┘
+      │                            │                    │
+      ▼                            ▼                    ▼
+┌───────────────┐         ┌────────────────┐    ┌──────────────────────┐
+│ PostgreSQL    │         │ Cache backend  │    │ External services    │
+│  + pgvector   │         │ (Valkey or     │    │ (Ollama, OpenAI,     │
+│  (RLS, HNSW)  │         │  in-process)   │    │  IM APIs, MCP srv)   │
+└───────────────┘         └────────────────┘    └──────────────────────┘
+```
+
+**Deployment posture (DEC-DEPLOY-001):** the marketed default is **single-tenant air-gap** — one xiaoguai binary plus one Postgres, no cache broker, no outbound internet. Multi-tenant SaaS uses the same binary with cache promoted to Valkey/Redis and OIDC pointed at the tenant IdP.
+
+---
+
+## 2. Module map (32 crates)
+
+Grouped by domain. Crate names are the source of truth; one LLD per starred (★) crate ships alongside this HLD.
+
+| Domain | Crate | Role |
+|---|---|---|
+| Foundations | `xiaoguai-types` | Shared DTOs, ID newtypes, error enum |
+|  | `xiaoguai-config` | YAML + env loader, hot-reload boundary |
+|  | `xiaoguai-storage` ★ | sqlx repositories, RLS plumbing, migrations; in-process DashMap cache fallback when `cache.url == ""` (Tier-1b, PR #60) |
+|  | `xiaoguai-auth` | OIDC verify, Casbin enforcer |
+|  | `xiaoguai-audit` ★ | HMAC chain, PII redactor, OTel decorator; **per-framework compliance export module (SOC2 CC7.2 / GDPR Art. 30 / HIPAA §164.312, PR #74, T5)** |
+| LLM + MCP | `xiaoguai-llm` ★ | LlmRouter, 8 provider backends, UsageSink, conservative `token_count` estimator (PR #66) |
+|  | `xiaoguai-mcp` ★ | MCP client, supervisor, transports; **outbound OAuth 2.1 PKCE auth module + `TokenStore` (PR #73, T4)** |
+|  | `xiaoguai-mcp-exec` ★ | Sandboxed Python `execute_python` server |
+|  | `xiaoguai-mcp-exec-js` ★ | **Sandboxed JavaScript `execute_javascript` server, Deno default (PR #75, T6); separate trust boundary** |
+| Agent runtime | `xiaoguai-agent` ★ | ReAct loop, parallel tool dispatch, HotL gate (Tier-2 prereq, PR #61), LLM-summarisation compaction (Tier-2d, PR #66, v0.5.4.1), **`propose_skill` synthetic MCP tool routing to skill-author flow (PR #72, T3)** |
+|  | `xiaoguai-runtime` ★ | Worker pool, queue, cancellation registry |
+|  | `xiaoguai-orchestrator` ★ | Multi-agent dispatch + coordination |
+| Memory + RAG | `xiaoguai-memory` ★ | pgvector-backed long-term memory |
+|  | `xiaoguai-rag` ★ | Document loaders, chunkers, retrievers exposed as MCP tools |
+| Scheduling | `xiaoguai-scheduler` | Six triggers, four sinks, audit-on-fire |
+|  | `xiaoguai-watch` | Active-wakeup watchers (SQL / HTTP) |
+|  | `xiaoguai-anomaly` | Z-score / EWMA monitors |
+| Eval | `xiaoguai-eval` | `.eval.yaml` runner, capability + regression split |
+| API + CLI | `xiaoguai-api` | Axum router, SSE, Toolbox state; **`/v1/skills/proposals/*` (T3), `/v1/audit/exports` (T5) routes** |
+|  | `xiaoguai-cli` | clap-based unified CLI; **`xiaoguai skills proposals {list,approve,reject}` (T3), `xiaoguai audit export --framework …` (T5), `xiaoguai mcp register --auth oauth2-pkce …` (T4)** |
+|  | `xiaoguai-core` | (legacy shim; thin re-export for back-compat with systemd units) |
+| IM | `xiaoguai-im-gateway` ★ | `ImProvider` trait, dispatcher |
+|  | `xiaoguai-im-feishu`, `-dingtalk`, `-wecom`, `-slack`, `-discord`, `-telegram`, `-mattermost` | Per-platform adapters |
+| Other | `xiaoguai-personas` ★ | Role presets, persona-scoped memory views |
+|  | `xiaoguai-tasks` ★ | Kanban board, auto-dispatcher; **`skill_author` module (manifest validator + `propose/approve/reject` lifecycle, PR #72, T3)** |
+|  | `xiaoguai-observability` | OTel + Prometheus exporters |
+
+`xiaoguai-core` exists as a legacy entry point for systemd / .deb compatibility (PR #59 unified binary). New deployments use `xiaoguai serve`.
+
+---
+
+## 3. Architectural decisions
+
+### DEC-001 — Single self-contained binary (Tier-1a)
+
+**Statement:** `xiaoguai-core/main.rs` was reduced to a thin shim; the real entry point is `xiaoguai serve` in the unified CLI. The IM gateway, agent loop, MCP supervisor, and API all link into one binary.
+
+**Rationale:** Operations told us deploys with separate `xiaoguai-core` + `xiaoguai-im-gateway` doubled the failure surface (mTLS provisioning, gRPC reconnection logic) for marginal benefit. A single binary is air-gap-friendly and reduces what an operator has to monitor.
+
+**Trade-off:** loses the ability to scale IM gateway independently; mitigated by horizontal pod scaling and the in-process channel design.
+
+**Refines:** REQ-NFR-006, MR-CACHE-001.
+
+### DEC-002 — Cache backend selectable at boot (Tier-1b)
+
+**Statement:** `Cache::connect("")` boots an in-process DashMap. Any `redis://` / `rediss://` URL switches to a Valkey/Redis client. No live failover.
+
+**Rationale:** Air-gap deployments cannot afford a Valkey container. In-process backend honours sub-second TTLs (Redis clamps at 1 s); state is intentionally ephemeral (rate-limit windows, IM session locks, smoke heartbeats).
+
+**Trade-off:** in-process state does not survive restart and cannot be shared across replicas — explicitly opt-out of HA.
+
+**Refines:** DEC-DEPLOY-001 (from PRD), MR-CACHE-001.
+
+### DEC-003 — Memory embedder selectable at boot
+
+**Statement:** Boot-time `OLLAMA_HOST` envar selects `OllamaEmbedder` (semantic) or `InMemoryEmbedder` (deterministic hash). No runtime fail-over between them.
+
+**Rationale:** Decouples integration testing (no Ollama) from production (semantic recall). Single knob avoids configuration drift.
+
+**Trade-off:** dimension is hard-wired to `all-minilm`'s 384 unless the schema is altered.
+
+**Refines:** REQ-MEM-002, MR-MEM-001.
+
+### DEC-004 — Audit chain redacts PII before signing (Tier-1c)
+
+**Statement:** `xiaoguai-audit::redact` strips emails, IPv4, `Bearer <token>` and AWS access keys from `actor`, `resource`, and `details` before HMAC. Signature is computed over the redacted form, so the chain remains verifiable.
+
+**Rationale:** PII may leak through tool results into the audit log; if redaction happened *after* signing the chain becomes a leak vector.
+
+**Trade-off:** if redaction is later turned off (or pattern set is changed) historical rows are still signed under their original setting. Verifier accepts because the rows match their own redacted form.
+
+**Mitigates:** RISK-SEC-002. **Refines:** REQ-AUD-003, REQ-NFR-007.
+
+### DEC-005 — Sandbox via ulimit + tokio timeout (Tier-2a)
+
+**Statement:** `xiaoguai-mcp-exec` runs Python snippets in a fresh tempdir, with `ulimit -v` (address-space), tokio `timeout` (wall-clock), env scrub, 64 KiB output cap, and stderr PII redaction. Network egress is not blocked at this layer — Kubernetes NetworkPolicy or `--network none` is the defense.
+
+**Rationale:** wasmtime+pyodide is the more isolated future option but heavy to ship today; landlock+seccomp is Linux-only and breaks macOS development. ulimit+timeout is x-platform, ships now, and combines with NetworkPolicy at the deployment layer.
+
+**Trade-off:** macOS `ulimit -v` is advisory; production must run Linux containers. No JS runtime yet.
+
+**Mitigates:** RISK-SEC-003. **Refines:** REQ-MCP-004.
+
+### DEC-006 — HotL gate enforces allow-then-escalate
+
+**Statement:** Per-tenant `hotl_policies` row defines `(scope, window_secs, max_count, max_spend_usd, escalate_to)`. Agent ReAct loop dispatches every tool call through `HotlGate.check(scope, amount)`. Budget exhaustion does not deny; it routes the request to the escalate channel and feeds a synthetic ToolResult back to the agent. Policy-store outage fails closed (denies tool calls).
+
+**Rationale:** Hard-deny breaks long-running agent runs unexpectedly; allow-then-escalate gives operators time to react. Fail-closed on store outage stops runaway behaviour.
+
+**Mitigates:** RISK-COST-001. **Refines:** REQ-HOTL-001, REQ-HOTL-002, REQ-HOTL-003.
+
+### DEC-007 — Skill packs are local-first and signed
+
+**Statement:** Packs install from local filesystem or a tenant-private index. Each pack metadata includes a signature; install rejects unsigned packs unless the operator explicitly opts in. Hot-reload is deferred to next session boot (ADR-0017).
+
+**Rationale:** Air-gap deployments cannot reach an internet marketplace. Signature requirement contains supply-chain risk in environments where the operator does not pre-vet every pack.
+
+**Mitigates:** RISK-SEC-001. **Refines:** REQ-SKILL-003.
+
+### DEC-008 — Postgres RLS double-layer multi-tenancy
+
+**Statement:** Every tenant-scoped table carries an RLS policy `USING (tenant_id = current_setting('app.current_tenant_id'))`. The application also injects `WHERE tenant_id = $1` in every query.
+
+**Rationale:** Defence in depth. App-layer prevents accidental SQL bugs; RLS prevents disaster if app-layer is bypassed.
+
+**Mitigates:** RISK-SEC-004. **Refines:** REQ-AUTH-003.
+
+### DEC-009 — Zero default outbound telemetry (ADR-0013)
+
+**Statement:** No telemetry leaves the process without operator opt-in. Prometheus `/metrics` is local-pull. OTLP export is configured per-deploy. PII redaction is mandatory on both channels.
+
+**Mitigates:** RISK-SEC-002 partially. **Refines:** REQ-NFR-007, REQ-NFR-008.
+
+### DEC-010 — Outcomes daily-bucketed and tenant-scoped reads (ADR-0016)
+
+**Statement:** Outcome rows are written raw, but reads via `/v1/outcomes/{summary,timeseries}` are aggregated by day and scoped to the calling tenant. No cross-tenant rollup endpoint.
+
+**Refines:** REQ-OUT-002.
+
+### DEC-011 — Orchestrator is multi-agent dispatch, not a workflow engine
+
+**Statement:** `xiaoguai-orchestrator` schedules agent peers (each a `xiaoguai-agent` instance with its own persona) and coordinates intermediate results. It is not a BPMN-style stateful workflow engine.
+
+**Rationale:** Demand observed during v1.4 was for agents-cooperate-on-one-task, not for designer-defined branching pipelines. The orchestrator depends on `xiaoguai-personas` and inherits per-agent HotL budgets.
+
+**Refines:** REQ-CHAT-004 (parallel dispatch generalises to peer agents), DEC-PERSONA-001.
+
+### DEC-012 — Personas are role presets + persona-scoped memory views
+
+**Statement:** `xiaoguai-personas` stores `(persona_id, system_prompt, default_tools, default_skills)`. Memory rows carry an optional `persona_id`; recall queries can be persona-filtered.
+
+**Refines:** REQ-CHAT-001 (entry point passes a persona_id), REQ-MEM-001.
+
+### DEC-013 — History compaction is LLM-summarisation with slide fallback (Tier-2d, v0.5.4.1)
+
+**Statement:** When the conservative token-count estimate of the in-flight conversation crosses `compaction.trigger_at_pct` (default 75 %) of `compaction.max_context_tokens` (default 30 000), the agent loop replaces the older head of the message list with a single synthetic `Role::System` message carrying an LLM-generated summary, preserving the original `Role::System` prompt and the last `keep_recent` (default 6) turns verbatim. On summariser failure (network, empty output, backend error), the path falls back to `history::slide(keep_recent + 1)` so the loop never blocks on a flaky summary model. Compaction is **opt-in** per tenant via `agent.compaction.enabled` in `local.yaml` — legacy callers (`AgentConfig.compaction = None`) keep the v0.5.4 slide-only behaviour.
+
+**Rationale:** Long agent sessions on local 32k-context Ollama models used to fail with provider 400s once history grew past the window. Pure slide dropped facts the agent later needed. LLM-summarisation preserves concrete facts (names, IDs, paths) while bounding tokens; falling back to slide keeps reliability when the summariser is unavailable. Plan D.2 of session-6 (PR #66) ships it. Provider-native compaction (Anthropic `cache_control`, OpenAI conversation IDs) is preferred when available and the operator can keep this feature off on those backends.
+
+**Refines:** REQ-CHAT-007 (long-session reliability), DEC-001 (single binary still ships compaction inside `xiaoguai-agent`), R.E.S.T Efficiency (token budget) + Reliability (fallback path).
+
+**Metrics:** `xiaoguai_compaction_triggered_total{reason}`, `xiaoguai_compaction_fallback_total{reason}`, `xiaoguai_compaction_token_savings` histogram. Healthy ratio `fallback / triggered < 5 %`; above that, swap `summary_model`.
+
+### DEC-014 — Agent-authored skills are whitelist-only, HotL-gated, admin-approved (PR #72, T3)
+
+**Statement:** A new synthetic MCP tool `propose_skill` lets the agent author skill-pack manifests at runtime. Each proposal must pass three gates: (a) **validator** in `xiaoguai-tasks::skill_author` enforces that the manifest references existing tool names only — it CANNOT declare new MCP servers, load native code, or include `propose_skill` itself (no recursion); (b) **HotL gate** under bucket `skill_author` with a default budget of 5 proposals per tenant per day; (c) **admin approval** via `POST /v1/skills/proposals/:id/approve` (Casbin action `skill.approve`). Approved manifests materialise to `~/.xiaoguai/skills/<name>-<version>.yaml`. The feature is **off by default**; per-tenant config `tenant_settings.allow_skill_authoring=true` is required.
+
+**Rationale:** Hermes Agent parity — agent self-extension is a core capability. But unrestricted skill authoring is a sandbox-escape vector. The three-gate model (validator + HotL + admin) is the harness equivalent of "data-driven evolution with human guard rails" from PHILO §5 dimension 育马 (Cultivating). Disabled tenants silently drop proposals with no audit emission, so the surface is invisible until explicitly enabled.
+
+**Refines:** REQ-SKILL-001 (skill marketplace), PHILO §5 (data-driven evolution + 育马), PHILO §11 (anti-pattern "letting the LLM author its own escapes" — the gates make this safe). R.E.S.T Security dominant.
+
+**Audit:** `skill.propose`, `skill.hotl_gate`, `skill.approve` / `skill.reject` rows all enter the HMAC chain. Three-row sequence per lifecycle ensures full traceability.
+
+### DEC-015 — Outbound MCP OAuth 2.1 PKCE is hand-rolled, tokens per-tenant in RLS table (PR #73, T4)
+
+**Statement:** Authed remote MCP servers (Linear, Notion, GitHub MCP, Anthropic-hosted connectors) require OAuth 2.1 with PKCE (RFC 7636). Implementation is **hand-rolled** in `xiaoguai-mcp::auth::oauth2_pkce` using existing workspace deps (`rand 0.10`, `sha2 0.11`, `base64 0.22`) — no new `oauth2` crate dependency. Tokens stored in new `mcp_oauth_tokens` table with RLS isolating `(server_id, tenant_id)` rows. `HttpMcpClient::connect_with_store` auto-refreshes when `expires_at < now + 60s` and atomically persists rotated refresh tokens per RFC 6749 §6. TLS verification is **on by default**; `XIAOGUAI_MCP_OAUTH_INSECURE=1` is the only escape hatch, logged at `warn`.
+
+**Rationale:** Hand-rolled PKCE is ~120 LOC vs adding `oauth2 = "5"` which pulls a new `getrandom 0.3` chain and alternative async-http abstraction. Avoids transitive-dep churn. RLS on tokens means the api/cli crates never need to filter by tenant — Postgres enforces it. Refresh-token encryption-at-rest is **deferred to a separate hardening PR** (HMAC signing key ≠ symmetric encryption key; reusing audit infrastructure would conflate concerns).
+
+**Refines:** REQ-MCP-AUTH-001, PHILO §15 (policy gateway — OAuth tokens are *outbound* authn, not *inbound* policy). R.E.S.T Security dominant.
+
+**Audit:** OAuth flow emits `mcp.oauth.consent` and `mcp.oauth.refresh` rows. Refused TLS / invalid state errors emit `mcp.oauth.deny` with reason.
+
+### DEC-016 — Compliance export from audit chain is chain-verify-non-bypassable (PR #74, T5)
+
+**Statement:** A new `xiaoguai audit export --framework {soc2|gdpr|hipaa} …` CLI subcommand and matching `POST /v1/audit/exports` HTTP endpoint produce per-framework audit-report bundles (SOC2 CC7.2, GDPR Art. 30, HIPAA §164.312). Each bundle's header carries a `ChainProof { first_id, last_id, count, start_prev_hmac_hex, end_hmac_hex }`. **Chain verification runs before every export** — there is no `--skip-verify` flag, no override env var, no admin bypass. If `verify_chain` finds a break, the export returns `ChainBroken { first_broken_id, first_broken_ts }` and exits non-zero. JSON is the canonical format; CSV is a deterministic projection with identical row counts and semantics. PDF is stubbed (`PdfUnimplemented` → HTTP 501) — deferred to a separate follow-up PR.
+
+**Rationale:** The audit chain's whole point is tamper-evidence. An export path that lets you skip verification would make the chain compliance-useless. The trade-off (no way to extract data when chain is broken) is intentional — the answer to a broken chain is to investigate, not to ship a tainted report. Auditors get the `ChainProof` header as evidence the export reflects an intact chain at the verified time window.
+
+**Refines:** REQ-AUDIT-EXPORT-001, ADR-0009 (HMAC chain integrity), PHILO §17 (anti-pattern "trusting tool output as user input" — we don't trust a broken chain to be reported as fine). R.E.S.T Traceability dominant.
+
+**Architecture:** New trait `AuditChainExporter` in `xiaoguai-api`; impl `PgAuditAdapter` in `xiaoguai-core`. Mirrors the existing `AuditReader` / `AuditVerifier` bridge pattern so the api crate never sees the signing key.
+
+### DEC-017 — Polyglot sandbox tier is separate crates per language, shared L1 contract (PR #75, T6)
+
+**Statement:** `execute_javascript` ships as a **new sibling crate** `xiaoguai-mcp-exec-js`, not as a `--runtime js` flag on `xiaoguai-mcp-exec`. Both crates implement the same L1 contract per PHILO §14: `ulimit -v` memory cap + tokio deadline timeout + env-scrubbed subprocess (`PATH`, `LANG`, `LC_ALL`, `LC_CTYPE` only) + fresh tempdir CWD + 64 KB output cap + stderr PII redaction via `xiaoguai-types::redact_str`. Default JS runtime is **Deno** (with `--allow-none` for runtime-enforced sandboxing); `--runtime node` is supported as an operator opt-in. Default memory raised to 1024 MB (V8 needs more headroom than CPython's default 256 MB).
+
+**Rationale:** **Trust boundary physical separation.** A Python sandbox escape and a JavaScript sandbox escape have different attack surfaces (V8 JIT vs CPython interpreter vulnerability classes). Sharing the binary means a single CVE in either path compromises both. Separate crates → separate binaries → separate process spaces → composable failures stay isolated. The HotL bucket is also separate (`tool_call.execute_javascript`) so operators decide per-language whether to grant agents access.
+
+Why **Deno over Node**: `--allow-none` makes network/filesystem capability denial enforced by the runtime itself, not by our wrapper. Operator-auditable (`--allow-net` etc. are explicit grants). Rejected `boa_engine` (embedded JS engine) as a third option because it's not feature-complete enough for real agent workloads. Documented in `docs/designs/tier2-mcp-exec-js.md`.
+
+**Refines:** REQ-TOOL-EXEC-002 (Hermes parity), PHILO §14 (sandbox tiering), PHILO §17 (anti-pattern "one giant Agent that does everything" — the same logic applies to sandbox binaries). R.E.S.T Efficiency (small snippet sizes for JSON/DOM/regex) + Security (trust isolation).
+
+**Future-compatible:** ADR-0020 (L3 sandbox feasibility) decided wasmtime+pyodide as the L3 path. The L1 crates' module structure (`exec.rs` / `tools.rs` / `server.rs`) is preserved so they can grow a `runtime: Option<Box<dyn ExecBackend>>` field where L1 stays the default and L3 (`xiaoguai-mcp-exec-wasm`) becomes an opt-in via config.
+
+### DEC-018 — L3 sandbox path is wasmtime+pyodide, deferred 2–3 sprints (ADR-0020)
+
+**Statement:** When the L3 sandbox tier from PHILO §14 lands, it will be implemented via **wasmtime + pyodide** (Python) and **wasmtime + QuickJS-WASM** (JavaScript), not Firecracker micro-VMs and not gVisor. Implementation is **deferred** to a follow-up sprint (~3 weeks calendar across 2–3 sprints per ADR-0020 §"Implementation phasing"). This decision locks in the design commitment so the L1 crates (`xiaoguai-mcp-exec`, `xiaoguai-mcp-exec-js`) can extract an `ExecBackend` trait in their next refactor without ambiguity about the future L3 shape.
+
+**Rationale (from ADR-0020):** wasmtime+pyodide wins on (a) cross-platform dev parity — works on macOS, which Firecracker doesn't and gVisor doesn't; (b) Rust-native — already in our build chain; (c) capability model fits PHILO §15 policy gateway exactly (no default Linux ABI to over-grant); (d) cold-start cache via `Engine::precompile_module` brings per-call latency to ~10 ms; (e) polyglot story is trivial (each language is a WASM module).
+
+**Refines:** PHILO §14 (sandbox tiering), DEC-017 (polyglot sandbox tier). R.E.S.T Security dominant.
+
+**Trade accepted:** pyodide CPython is 2–4× slower than native on CPU-heavy work; pyodide stdlib gaps (e.g., `subprocess`, `socket`) require explicit error messages when forbidden imports are used. Both documented in the future LLD when the implementation lands.
+
+---
+
+## 4. Runtime model
+
+### 4.1 Request lifecycle (single-agent chat)
+
+```
+[chat-ui] --POST /v1/sessions/{id}/messages--> [xiaoguai-api]
+                                                  │
+                                                  ├─ Auth: verify JWT → tenant_id, user_id, roles
+                                                  ├─ Casbin: check (role, action, resource)
+                                                  ├─ Set local SQL: app.current_tenant_id
+                                                  ├─ Persist user message row (messages)
+                                                  ├─ Audit: session.message.create
+                                                  │
+                                                  ▼
+                                            [xiaoguai-agent: ReAct loop]
+                                                  │
+                                                  ├─ PreProcessor:
+                                                  │     • token estimate (xiaoguai-llm::token_count)
+                                                  │     • if est > trigger_threshold → history::compact
+                                                  │            (LLM summary; slide on fallback)
+                                                  │     • else                       → history::slide
+                                                  │     • sys prompt inject
+                                                  ├─ LLM call (stream) via xiaoguai-llm router
+                                                  ├─ if tool_calls:
+                                                  │     for each call:
+                                                  │       HotlGate.check(scope, amount)
+                                                  │       if allowed: dispatch to MCP client (tokio::join_all)
+                                                  │       else if escalated: synth ToolResult; route to escalate_to
+                                                  │       else if policy_unavailable: synth ToolResult; deny
+                                                  ├─ Audit each tool call
+                                                  ├─ Loop until max_iterations or no tool_calls
+                                                  │
+                                                  ▼
+                                            [PostProcessor]
+                                                  │
+                                                  ├─ token_usage row (per LLM stream segment)
+                                                  ├─ persist assistant message
+                                                  ├─ audit: session.message.complete
+                                                  │
+                                                  ▼
+                                            SSE: final event → client
+```
+
+### 4.2 Multi-agent flow (orchestrator)
+
+```
+                  ┌─[Persona A: planner]──┐
+[orchestrator] ─→ ├─[Persona B: researcher]├─→ aggregate → final
+                  └─[Persona C: critic]────┘
+```
+
+Each peer runs an independent ReAct loop with its own HotL budget scope. The orchestrator passes intermediate results between peers and stops when consensus / max-rounds is reached.
+
+### 4.3 Cancellation registry
+
+`xiaoguai-runtime` exposes a `CancellationRegistry` keyed by `session_id`. `POST /v1/sessions/{id}/cancel` writes a cancel token; the ReAct loop polls the token between iterations and at tool-call boundaries. Bounded latency is the slowest in-flight tool call.
+
+---
+
+## 5. Data model
+
+20 sqlx migrations under `crates/xiaoguai-storage/migrations/`. Highlights:
+
+| Migration | Key tables | Indexes / RLS |
+|---|---|---|
+| 0001 | `tenants`, `users`, `user_roles`, `sessions`, `messages` | RLS on all five |
+| 0002 | `audit_log` | append-only; `hmac` not null; partial index on `(tenant_id, sequence)` |
+| 0003 | `llm_providers` | RLS; index on `(tenant_id, kind)` |
+| 0004 | `token_usage` | RLS; partition-by-month candidate |
+| 0005 | `mcp_servers` | RLS |
+| 0006 | `im_identities` | RLS; unique `(platform, platform_user_id)` |
+| 0007 | `scheduled_jobs` | RLS |
+| 0008 | `sessions.parent_session_id` | self-FK |
+| 0009 | `scheduler_webhook_tokens` | RLS; hashed token |
+| 0010 | `llm_providers.cost_per_1k_*` | (alter) |
+| 0011 | `hotl_policies` | RLS |
+| 0012 | `outcomes` | RLS; daily bucket index `(tenant_id, recorded_at::date)` |
+| 0013 | `audit_export_state` | export checkpoint |
+| 0014 | `tenant_rate_limit_config` | RLS |
+| 0015 | `skill_packs`, `pack_operators` | RLS; signature column |
+| 0016 | `personas` | RLS |
+| 0017 | `workspaces` | RLS |
+| 0018 | `boards`, `tasks`, `task_state_log` | RLS |
+| 0019 | `memories`, `recall_traces` | RLS; pgvector HNSW on `content_embedding vector(384)` cosine |
+| 0020 | seed `ollama-local` provider | data-only |
+
+RLS plumbing is centralised in `xiaoguai-storage`. Repositories must call `Storage::with_tenant(tenant_id)` to set the `SET LOCAL` for the transaction.
+
+---
+
+## 6. Cross-cutting concerns
+
+### 6.1 Auth
+
+- OIDC token verification: `xiaoguai-auth::OidcVerifier` caches JWKs with `Cache-Control` honoured.
+- IM-based OAuth (Feishu / DingTalk / WeCom) is wrapped as an OIDC-adapter trait so the rest of the system treats them identically.
+- Casbin policy reload is on-demand (`POST /v1/admin/casbin/reload`) and on boot.
+
+### 6.2 Audit
+
+- Append-only, never UPDATE / DELETE.
+- HMAC key in Kubernetes Secret `xiaoguai-audit`; rotation window 30 days; verifier accepts dual keys during rotation.
+- `XIAOGUAI_AUDIT_REDACT_PII=true` by default.
+
+### 6.3 Observability
+
+- Prometheus `/metrics` (local-pull). OTLP traces and metrics exported only when `XIAOGUAI_OTEL__EXPORT_URL` is configured.
+- `RedactingSpanExporter` wraps every exporter to strip PII before egress.
+- Structured JSON logs via `tracing-subscriber`.
+
+### 6.4 Cache
+
+- DashMap backend by default. `XIAOGUAI_CACHE__URL=redis://…` opts into Valkey/Redis.
+- Switching modes requires restart.
+
+### 6.5 Secrets
+
+- Kubernetes Secrets, env vars, or local file. `age`-encrypted-per-tenant secret store is a v2 candidate.
+- No secrets are propagated to MCP child processes.
+
+---
+
+## 7. Deployment topologies
+
+### 7.1 Single-tenant air-gap (DEFAULT)
+
+```
+[Node]
+ ├─ xiaoguai serve         (binary, single process)
+ ├─ Postgres 17 + pgvector (container or systemd)
+ └─ Ollama                  (container or systemd; serves models locally)
+
+Cache: in-process DashMap (no Valkey)
+LLM:   ollama-local enabled; cloud providers seeded disabled
+Audit: HMAC key in local Secret/file
+```
+
+Helm chart `deploy/helm/xiaoguai` ships a `values.yaml` profile for this shape: no Valkey, no S3, single replica.
+
+### 7.2 Multi-tenant SaaS (opt-in)
+
+```
+[Ingress]
+ └─ xiaoguai serve × N replicas
+       │
+       ├─ Postgres primary + read replicas
+       ├─ Valkey cluster (cache backend)
+       ├─ Ollama / vLLM cluster (local models) or
+       │   tenant-supplied cloud provider keys
+       └─ Prometheus + OTel collector
+```
+
+`values-ha.yaml` shows the multi-replica template. Each tenant retains its own RLS scope, HotL policies, MCP server registry, and provider rows.
+
+### 7.3 Deployment artefacts inventory
+
+| Artefact | Purpose |
+|---|---|
+| `deploy/Dockerfile` | Multi-stage Rust build → distroless runtime (~ 180 MB) |
+| `deploy/docker-compose.yml` | Local dev compose |
+| `deploy/docker-compose.ha.yml` | HA reference (3× xiaoguai, 3× PG, pgBouncer, HAProxy) |
+| `deploy/helm/xiaoguai/` | Helm chart (12 template files, 9 test files) |
+| `deploy/kustomize/` | Base + staging + production overlays |
+| `deploy/istio/` | VirtualService / DestinationRule samples |
+| `deploy/systemd/xiaoguai-core.service` | systemd unit for bare-metal |
+| `deploy/terraform/` | AWS / GCP IaC |
+| `deploy/otel-collector-*.yaml` | OTel collector configs (basic + advanced) |
+| `deploy/prometheus.yml` | Scrape config |
+
+---
+
+## 8. Failure modes & resilience
+
+| Failure | System response |
+|---|---|
+| Postgres unreachable | All `/v1/**` return `503 dependency_unavailable`; agent loop fails the in-flight tool call; HotL fail-closed. |
+| Cache backend lost (Valkey mode) | Rate-limit windows reset; sessions continue (cache is ephemeral); cluster operator can fail back to in-process by restart. |
+| Ollama unreachable | LLM router cascades to next provider in `fallback_order`; if Ollama is the only enabled provider, the request returns `503 dependency_unavailable` with the underlying message. |
+| MCP child process hangs | Per-call `timeout_secs` deadline kills it; HotL increment still applied. |
+| Audit write fails | Chain protected (no partial write); request returns `500 internal_error`; operator alerted via PagerDuty (Prometheus rule). |
+| Bad clock skew | JWT verification fails (`invalid_token`); operator must NTP-sync. |
+
+---
+
+## 9. Risk mapping
+
+| HLD decision | Mitigates | Refines |
+|---|---|---|
+| DEC-001 unified binary | OPS sprawl | REQ-NFR-006 |
+| DEC-002 in-process cache | Operational complexity in air-gap | DEC-DEPLOY-001 |
+| DEC-003 boot-time embedder | Configuration drift | REQ-MEM-002 |
+| DEC-004 redact-before-sign | RISK-SEC-002 | REQ-AUD-003 |
+| DEC-005 sandbox ulimit + tempdir | RISK-SEC-003 | REQ-MCP-004 |
+| DEC-006 HotL allow-then-escalate | RISK-COST-001 | REQ-HOTL-002 |
+| DEC-007 signed skill packs | RISK-SEC-001 | REQ-SKILL-003 |
+| DEC-008 RLS double-layer | RISK-SEC-004 | REQ-AUTH-003 |
+| DEC-009 zero default telemetry | RISK-SEC-002 (partial) | REQ-NFR-008 |
+| DEC-010 daily-bucketed outcomes | Cross-tenant inference | REQ-OUT-002 |
+| DEC-011 orchestrator scope | Q1 ambiguity | REQ-CHAT-004 |
+| DEC-012 persona scope | Q2 ambiguity | REQ-CHAT-001 |
+
+---
+
+## 10. PRD coverage summary
+
+| PRD section | Covered by |
+|---|---|
+| Conversation & agent loop | §4.1 runtime model, DEC-011 |
+| LLM routing | LLD `xiaoguai-llm`, fallback chain in §6.4 |
+| MCP | LLD `xiaoguai-mcp`, DEC-005 sandbox |
+| Memory & RAG | DEC-003, §5 migration 0019 |
+| IM gateways | LLD `xiaoguai-im-gateway`, §6.1 OIDC wrappers |
+| Auth & multi-tenancy | DEC-008 |
+| Audit | DEC-004, §6.2 |
+| HotL | DEC-006 |
+| Skill packs | DEC-007 |
+| Scheduler | §6.3 observability, LLD `xiaoguai-scheduler` (not in this batch) |
+| Outcomes | DEC-010 |
+| Orchestrator | DEC-011 |
+| Personas | DEC-012 |
+| NFR | §6, §7, §8 |
+
+---
+
+## 11. Traceability metadata
+
+<!-- TRACEABILITY-METADATA:BEGIN -->
+```yaml
+schema:
+  name: testany-traceability
+  version: "1.0.0"
+  profile: hld-profile-v1
+artifact:
+  id: HLD-XIAOGUAI-001
+  type: HLD
+  title: Xiaoguai high-level design — v1.4 retrofit
+  status: draft
+  owners: [engineering.xiaoguai, architecture.xiaoguai]
+  created_at: 2026-05-28
+  updated_at: 2026-05-28
+  source_documents:
+    - PRD-XIAOGUAI-001
+    - API-XIAOGUAI-001
+entities:
+  requirements: []
+  risks: []
+  must_not_regress: []
+  external_behaviors: []
+  decisions:
+    - { id: DEC-HLD-001, title: "Single self-contained binary", statement: "xiaoguai serve subsumes legacy xiaoguai-core; IM gateways link into the same binary.", status: approved, scope: in, decision: "One binary; legacy xiaoguai-core kept as shim.", rationale: "Air-gap simplicity; halves failure surface." }
+    - { id: DEC-HLD-002, title: "Cache backend selectable at boot", statement: "Cache::connect('') boots in-process DashMap; redis:// switches to Valkey/Redis.", status: approved, scope: in, decision: "Boot-time selection, no live failover.", rationale: "Air-gap mode needs no broker; sub-second TTL precision." }
+    - { id: DEC-HLD-003, title: "Memory embedder selectable at boot", statement: "OLLAMA_HOST envar selects OllamaEmbedder or InMemoryEmbedder.", status: approved, scope: in, decision: "Boot-time selection.", rationale: "Decouples integration from production." }
+    - { id: DEC-HLD-004, title: "Audit chain redacts PII before signing", statement: "Redaction patterns applied before HMAC.", status: approved, scope: in, decision: "Redact-then-sign.", rationale: "Sign-then-redact would invalidate verification; redact-before-sign keeps chain verifiable." }
+    - { id: DEC-HLD-005, title: "Sandbox via ulimit + tokio timeout", statement: "Python sandbox uses ulimit -v, tokio timeout, env scrub, tempdir.", status: approved, scope: in, decision: "ulimit + tokio timeout + tempdir; network egress at deployment layer.", rationale: "x-platform vs Linux-only landlock/seccomp; wasmtime+pyodide deferred." }
+    - { id: DEC-HLD-006, title: "HotL allow-then-escalate", statement: "Budget exhaustion escalates; policy outage fails closed.", status: approved, scope: in, decision: "Allow-then-escalate, fail-closed on store outage.", rationale: "Avoids surprise denials; protects against runaway behaviour when policy store is unreachable." }
+    - { id: DEC-HLD-007, title: "Local-first signed skill packs", statement: "Packs install from local fs or tenant index; signature required.", status: approved, scope: in, decision: "Signed local packs only; --allow-unsigned operator opt-in.", rationale: "Air-gap-compatible; bounded supply-chain risk." }
+    - { id: DEC-HLD-008, title: "RLS double-layer multi-tenancy", statement: "App-layer WHERE + Postgres RLS policy.", status: approved, scope: in, decision: "Both layers mandatory.", rationale: "Defence in depth." }
+    - { id: DEC-HLD-009, title: "Zero default outbound telemetry", statement: "No telemetry leaves without operator opt-in.", status: approved, scope: in, decision: "Opt-in OTel + Prometheus pull only.", rationale: "Enterprise privacy posture." }
+    - { id: DEC-HLD-010, title: "Outcomes daily-bucketed reads", statement: "Outcome reads aggregated by day, tenant-scoped.", status: approved, scope: in, decision: "Daily bucket + tenant-scoped.", rationale: "Prevent cross-tenant inference." }
+    - { id: DEC-HLD-011, title: "Orchestrator is multi-agent dispatch", statement: "xiaoguai-orchestrator coordinates peer agents.", status: approved, scope: in, decision: "Multi-agent dispatch + coordination.", rationale: "Demand observed; not a workflow engine." }
+    - { id: DEC-HLD-012, title: "Personas are role presets", statement: "xiaoguai-personas stores presets and persona-scoped memory view.", status: approved, scope: in, decision: "Presets + memory.persona_id column.", rationale: "Matches existing schema and HANDOFF answer." }
+  flows:
+    - { id: FLOW-CHAT-001, title: "Single-agent chat lifecycle", statement: "User message flows through Auth → Casbin → ReAct loop → HotL gate → tool dispatch → SSE final.", status: approved, scope: in, kind: system_flow }
+    - { id: FLOW-MULTI-001, title: "Multi-agent orchestration", statement: "Orchestrator dispatches to planner/researcher/critic peers, aggregates results.", status: approved, scope: in, kind: system_flow }
+    - { id: FLOW-CANCEL-001, title: "Session cancellation propagation", statement: "Cancel token polled at iteration boundary; bounded by slowest in-flight tool.", status: approved, scope: in, kind: state_transition }
+  test_cases: []
+relations:
+  - { id: REL-HLD-001, type: refines, from: DEC-HLD-001, to: REQ-NFR-006, status: active }
+  - { id: REL-HLD-002, type: refines, from: DEC-HLD-002, to: MR-CACHE-001, status: active }
+  - { id: REL-HLD-003, type: refines, from: DEC-HLD-003, to: REQ-MEM-002, status: active }
+  - { id: REL-HLD-004, type: mitigates, from: DEC-HLD-004, to: RISK-SEC-002, status: active }
+  - { id: REL-HLD-005, type: mitigates, from: DEC-HLD-005, to: RISK-SEC-003, status: active }
+  - { id: REL-HLD-006, type: mitigates, from: DEC-HLD-006, to: RISK-COST-001, status: active }
+  - { id: REL-HLD-007, type: mitigates, from: DEC-HLD-007, to: RISK-SEC-001, status: active }
+  - { id: REL-HLD-008, type: mitigates, from: DEC-HLD-008, to: RISK-SEC-004, status: active }
+  - { id: REL-HLD-009, type: refines, from: DEC-HLD-011, to: REQ-CHAT-004, status: active }
+  - { id: REL-HLD-010, type: refines, from: DEC-HLD-012, to: REQ-MEM-001, status: active }
+  - { id: REL-HLD-011, type: refines, from: FLOW-CHAT-001, to: REQ-CHAT-001, status: active }
+  - { id: REL-HLD-012, type: refines, from: FLOW-MULTI-001, to: REQ-CHAT-004, status: active }
+  - { id: REL-HLD-013, type: refines, from: FLOW-CANCEL-001, to: REQ-CHAT-002, status: active }
+waivers: []
+```
+<!-- TRACEABILITY-METADATA:END -->
