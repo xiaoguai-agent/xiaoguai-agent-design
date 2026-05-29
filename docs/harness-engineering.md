@@ -396,9 +396,18 @@ Xiaoguai today implements:
   reply".
 - **Plan-and-Execute** — when `task.kind = plan` is set; the planner emits
   a JSON plan, the executor runs it. Used for orchestrator workflows.
-- **Multi-agent** — `xiaoguai-orchestrator` spawns sub-agents with their
-  own ReAct loops; budget enforcement composes (sub-agent budgets ≤ parent
-  remaining budget).
+- **Multi-agent (homogeneous, v1.4)** — `xiaoguai-orchestrator` spawns
+  multiple peers doing similar work; budget enforcement composes
+  (sub-agent budgets ≤ parent remaining budget).
+- **Planner / Worker / Critic triangle (heterogeneous, v1.6+, DEC-021)** —
+  structured role separation: Planner decomposes, Workers execute as
+  full ReAct loops, Critic accepts / requests revision / rejects each
+  Worker result. Cross-Worker context contamination prevented by
+  per-task `Scratchpad` quarantine. Parent budget splits 50/40/10
+  (Worker/Planner/Critic) by default. Reach for this over plain
+  Multi-agent when the work is genuinely heterogeneous (research →
+  synthesis → quality check) — homogeneous parallel still uses the v1.4
+  multi-agent path.
 
 Re-planning on failure is supported via the supervisor's "challenger" path
 (`xiaoguai-orchestrator::challenger`) — the supervisor can substitute a

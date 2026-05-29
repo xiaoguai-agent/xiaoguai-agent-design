@@ -17,6 +17,8 @@
 
 Personas are NOT user accounts; they are reusable role templates within a tenant.
 
+**v1.6+ (DEC-021)**: the three roles of the planner/worker/critic triangle (see [`lld-orchestrator.md`](lld-orchestrator.md) §4.4) are **regular personas** — the orchestrator picks any three `PersonaId`s for `OrchestrationPattern::Triangle { planner, worker, critic, … }`. To make role-shaped personas discoverable, operators conventionally name them with a `role/` prefix (e.g., `role/planner-default`, `role/worker-coder`, `role/critic-strict`) and tag them via the optional `tags` column added in migration `0025_persona_role_tags.sql`. The roles are **soft conventions**, not enforced types — a critic-tagged persona run as a Worker in a different invocation still works; the agent loop reads only `system_prompt` and `allowed_tools`. This keeps personas composable while DEC-021's role distinction stays at the orchestrator pattern layer.
+
 ## 2. Public interface
 
 ```rust
