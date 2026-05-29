@@ -256,6 +256,97 @@ Why **Deno over Node**: `--allow-none` makes network/filesystem capability denia
 
 **Trade accepted:** pyodide CPython is 2–4× slower than native on CPU-heavy work; pyodide stdlib gaps (e.g., `subprocess`, `socket`) require explicit error messages when forbidden imports are used. Both documented in the future LLD when the implementation lands.
 
+### DEC-019 — `ExecBackend` trait extraction enables L1↔L3 swap per tenant (sprint-8 prereq)
+
+**Statement:** Both L1 crates (`xiaoguai-mcp-exec`, `xiaoguai-mcp-exec-js`) extract their subprocess wrapper into a shared `ExecBackend` trait. The trait surface is:
+
+```rust
+#[async_trait]
+pub trait ExecBackend: Send + Sync {
+    fn name(&self) -> &'static str;        // "process-l1" | "wasmtime-l3"
+    async fn run(&self, snippet: &str, cfg: &ExecConfig) -> ExecResult;
+    fn capability_summary(&self) -> CapabilitySummary;  // for runbook + audit
+}
+```
+
+L1 implementations (`ProcessL1Python`, `ProcessL1JavaScript`) become the default. Per-tenant config `agent.sandbox_tier = "L1" | "L3"` (defaults to `L1`) selects the backend at MCP-tool dispatch time. The selector lives in `xiaoguai-mcp-exec::server::ExecServer::new` — config drives which backend impl is constructed; agent code never sees the tier.
+
+**Rationale:** Without trait extraction, an L3 implementation forks the binary at compile time, which makes it impossible for a single deployment to serve some tenants L1 and others L3. The trait is the architectural commitment that **tier selection is a runtime per-tenant decision, not a build-time switch**. ADR-0020 §"Implementation phasing" §1 commits to this extraction as Phase 1.
+
+**Refines:** DEC-017 (polyglot sandbox tier — same logic applies to tier switching), DEC-018 (L3 path).
+
+**Migration safety:** L1 stays the default. Operators opt into L3 per tenant via `tenant_settings.sandbox_tier = 'L3'`. No DB migration needed beyond a new column on `tenant_settings`.
+
+### DEC-020 — L3 sandbox implementation (`xiaoguai-mcp-exec-wasm`) is one crate hosting two language modules
+
+**Statement:** L3 ships as **a single new crate** `xiaoguai-mcp-exec-wasm` exposing:
+- `WasmtimePythonBackend` — wraps `wasmtime::Engine` + cached pyodide module
+- `WasmtimeJavaScriptBackend` — wraps `wasmtime::Engine` + cached QuickJS-WASM module
+
+Both implement `ExecBackend` (from DEC-019). They share a single `wasmtime::Engine` instance per process (the engine is heavy; instances are cheap). Cold-start cache uses `Engine::precompile_module` at process start; per-call instantiation is ~10 ms.
+
+The crate ships as two separate binaries (`xiaoguai-mcp-exec-wasm-py`, `xiaoguai-mcp-exec-wasm-js`) so operators can register them independently in the MCP supervisor — even though they share the engine, the operational surface stays two-MCP-servers.
+
+**Rationale:** Sharing the wasmtime engine cuts memory by ~50 % vs two separate processes (each would carry its own engine). The dual-binary surface preserves the per-language HotL bucket model from DEC-017. **Trust boundary is now at the WASM module boundary**, not the process boundary, but that's strictly stronger than L1's process boundary (WASM is capability-confined per module).
+
+**Refines:** DEC-018 (L3 path), DEC-019 (trait extraction), PHILO §14 (sandbox tiering).
+
+**Metrics:** `xiaoguai_wasm_cold_start_seconds`, `xiaoguai_wasm_engine_warm_cache_hits_total`, `xiaoguai_wasm_module_load_failed_total`.
+
+### DEC-021 — Multi-agent topology is planner-worker-critic triangle with shared memory view
+
+**Statement:** The orchestrator's current "spawn N agent peers, aggregate results" model evolves into an explicit **three-role triangle**:
+
+| Role | Responsibility | LLM call shape |
+|---|---|---|
+| **Planner** | Decompose user goal into a JSON plan of sub-tasks; assign each to one Worker | One LLM call per re-plan; small context (goal + tool list + persona) |
+| **Worker** | Execute one sub-task as a full ReAct loop; report `WorkerResult { artefact, citations, confidence, cost }` | N LLM calls per sub-task (the ReAct loop) |
+| **Critic** | Review every Worker result; either approve, request revision, or reject with reason | One LLM call per Worker result; small context (result + acceptance criteria) |
+
+**Shared memory view**: all three roles read the same per-session memory snapshot via a new `MemoryView` trait. Workers write to a private scratchpad that the Critic can read; only Critic-approved artefacts get promoted to the session-level memory. This prevents one Worker from contaminating another Worker's context.
+
+**Cost budget**: parent budget splits 50 / 40 / 10 (Worker / Planner / Critic) by default; operators tune per-persona. Critic budget being smallest is by design — it makes accept/reject decisions, not artefacts.
+
+**Rationale:** The current orchestrator is "M sub-agents do the same kind of work in parallel". Real multi-agent workflows (per Hermes, per the OpenAI Practices for Governing Agentic Systems paper) are heterogeneous roles with **separation of concerns matching the §5 decision-execution principle**. The planner-worker-critic triangle is the smallest non-trivial topology that captures this; larger topologies (planner-orchestrator-N-workers-critic-evaluator) are a follow-up.
+
+**Refines:** DEC-011 (orchestrator is multi-agent dispatch — refined into role-specialised dispatch), PHILO §5 (Decision ↔ Execution separation), PHILO §13 (Plan-and-Execute mode), R.E.S.T Reliability (Critic catches Worker errors before they propagate).
+
+**Metrics:** `xiaoguai_orchestrator_role_calls_total{role}`, `xiaoguai_orchestrator_critic_rejection_rate`, `xiaoguai_orchestrator_replan_count_total`.
+
+### DEC-022 — SLO model and 4 golden signals are first-class contract obligations
+
+**Statement:** Each user-facing capability has a published **Service Level Objective** with the four Google SRE golden signals:
+
+| Signal | Definition | Default SLO |
+|---|---|---|
+| **Latency** | p95 of `request_duration_seconds` | `/v1/chat/*` p95 < 5 s; `/v1/sessions/*/messages` p95 first-token < 2 s |
+| **Traffic** | requests/sec | per-tenant rate limits at `/etc/xiaoguai/config.yaml::rate_limits` |
+| **Errors** | non-2xx rate | < 1 % rolling 1h |
+| **Saturation** | resource consumption vs cap | `LLM tokens consumed / tenant_daily_budget < 0.8` |
+
+SLOs are **declarations**, not configurations — they live in `docs/runbooks/slo.md` and are referenced by alert rules. When an SLO is breached, the operator's runbook entry has the specific page chain.
+
+Burn-rate alerts (per SRE workbook): fast-burn (1-hour window) and slow-burn (6-hour window) for each signal. Alert routing via the existing `xiaoguai-watch` infrastructure — no new alerting plumbing.
+
+**Rationale:** R.E.S.T §2 names Traceability + Reliability + Efficiency + Security as the four goals; the four golden signals are the **operationalisation** of the first three. Without published SLOs, "is this deployment healthy?" is a judgement call rather than a measurable state. This DEC makes the answer mechanical: meet the SLO or page.
+
+**Refines:** PHILO §16 (metrics taxonomy — adds the SLO/burn-rate framing on top), R.E.S.T §2.
+
+**Adds:** `docs/runbooks/slo.md` (this DEC's deliverable), Grafana dashboard `slo-overview.json`, Alertmanager rules for fast-burn + slow-burn.
+
+### DEC-023 — Tier-2/3 follow-up hardening: refresh-token AES-GCM, PDF backend, agent-loop wiring (sprint-8 ⇄ 9 catch-up)
+
+**Statement:** Four debt items from sprint-7 ship in a single "follow-up hardening" track:
+
+1. **T4 refresh-token encryption at rest** — AES-GCM with a 32-byte key handle stored in the operator's env (`XIAOGUAI_MCP_OAUTH_TOKEN_KEY`). New `crates/xiaoguai-mcp/src/auth/at_rest.rs` module. Key-rotation via dual-key window (mirrors the existing audit-key rotation pattern from DEC-001's `XIAOGUAI_AUDIT_SIGNING_KEY`). RLS already handles tenant isolation; encryption-at-rest handles disk-snapshot threats.
+2. **T5 PDF rendering backend** — replaces the `PdfUnimplemented` stub with `typst`-based rendering (Rust-native, no JVM). Template files in `crates/xiaoguai-audit/templates/{soc2,gdpr,hipaa}.typ`. PDF output is deterministic for a given input bundle (auditors can verify byte-for-byte reproducibility).
+3. **T3 production wiring** — implements `PgSkillProposalRepository`, `PgTenantSettings`, and bridges in `xiaoguai-core::skill_author_bridge` so `propose_skill` works against a real Postgres without test stubs.
+4. **T6 agent-loop integration test** — mirrors PR #66 (compaction): an end-to-end test that boots `xiaoguai serve`, registers `xiaoguai-mcp-exec-js`, drives a chat that invokes `execute_javascript`, asserts the HotL counter bump and the audit row. Cements the operator workflow.
+
+**Rationale:** Each item is small individually but together they finish the v1.5.x line. Splitting across PRs avoids one mega-PR while keeping the scope coherent under one sprint heading.
+
+**Refines:** DEC-014 (T3 production wiring), DEC-015 (T4 refresh-token), DEC-016 (T5 PDF), DEC-017 (T6 wiring).
+
 ---
 
 ## 4. Runtime model
