@@ -249,6 +249,23 @@ This decision drives:
 
 ---
 
+### 4.14 Web UI surfaces (chat-ui + admin-ui)
+
+The product ships two SPAs under `frontend/` (DEC-025): an end-user **chat-ui** and an operator **admin-ui**. They share `@xiaoguai/shared::XiaoguaiClient` and a Playwright e2e harness.
+
+| ID | Functional requirement | Surface |
+|---|---|---|
+| REQ-UI-001 | Chat-ui renders the agent loop as a streaming conversation: composer, message bubbles, tool-call chips, inline citations, copy / regenerate / fork on each bubble | `@xiaoguai/chat-ui` |
+| REQ-UI-002 | Admin-ui covers every `/v1/admin/*` and operator-only endpoint with a dedicated pane; pane list lives in [`lld-admin-ui.md`](lld/lld-admin-ui.md) §2 | `@xiaoguai/admin-ui` |
+| REQ-UI-003 | Audit pane renders the HMAC chain with verified / rotation-amber / broken-red badges per row; supports per-framework compliance export (SOC2 / GDPR / HIPAA) | `@xiaoguai/admin-ui` |
+| REQ-UI-004 | Chat-ui surfaces three safety signals as first-class UI: HotL pending verdict (inline panel), watch-loop status (indicator pill), AI-content disclosure (EU AI Act Art. 50(1) banner, non-dismissible by default) | `@xiaoguai/chat-ui` |
+| REQ-UI-005 | Both SPAs ship `zh-Hans` + `en` i18n bundles; lint forbids untranslated JSX strings; Axe-core a11y violations fail e2e | both SPAs |
+| REQ-UI-006 | Neither SPA hosts a login page; authentication is delegated to the reverse proxy. On 401 → redirect to `VITE_LOGIN_URL` | both SPAs |
+| REQ-UI-007 | Admin-ui Personas pane provides CRUD over `/v1/personas`; pane tagged `role/{planner,worker,critic}` chips per DEC-021 (sprint-9 triangle) | `@xiaoguai/admin-ui` (sprint-10b) |
+| REQ-UI-008 | Admin-ui Skill Proposals pane provides approve / reject over `/v1/skills/proposals/*` (DEC-014, T3); wrapped in `<RequireScope name="skill.approve">` | `@xiaoguai/admin-ui` (sprint-10b) |
+
+UI non-functional requirements live in §5 below (added: REQ-NFR-011 first-token observable in UI; REQ-NFR-012 Playwright golden paths green on Chrome/Firefox/Safari; REQ-NFR-013 frontend bundle size budget).
+
 ## 5. Non-functional requirements
 
 | ID | Class | Statement | Priority | Acceptance criteria |
@@ -263,6 +280,10 @@ This decision drives:
 | REQ-NFR-008 | Privacy | Zero telemetry to upstream Anthropic / OpenAI / Xiaoguai authors by default (ADR-0013) | P0 | No outbound calls without explicit operator opt-in |
 | REQ-NFR-009 | Footprint | Container image size ≤ 200 MB (distroless runtime) | P1 | CI image-size check |
 | REQ-NFR-010 | License compliance | All transitive deps under MIT / Apache-2.0 / BSD-2 / BSD-3 / ISC / Zlib / MPL-2.0 / BSL-1.0 (redis) | P0 | `cargo deny check licenses` zero violations |
+| REQ-NFR-011 | UI performance | Chat-ui first-token rendered ≤ 1.5 s P95 against local Ollama (mirrors REQ-NFR-001 at the UI layer — composer submit → first delta visible) | P1 | Playwright perf test on `@xiaoguai/chat-ui` |
+| REQ-NFR-012 | UI compatibility | Playwright golden-path suites green on Chromium / Firefox / WebKit (Safari) for both chat-ui and admin-ui | P1 | `pnpm -r test:e2e` in CI |
+| REQ-NFR-013 | UI footprint | Each SPA's production build ≤ 1 MB gzipped initial bundle (excluding chunked routes) | P2 | `vite build` size budget assertion in CI |
+| REQ-NFR-014 | UI accessibility | Axe-core serious + critical violations = 0 on all golden-path pages | P1 | Axe runs inside Playwright e2e harness |
 
 ---
 
