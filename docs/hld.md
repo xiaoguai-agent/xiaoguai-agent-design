@@ -66,7 +66,7 @@ Grouped by domain. Crate names are the source of truth; one LLD per starred (★
 |  | `xiaoguai-storage` ★ | sqlx repositories, RLS plumbing, migrations; in-process DashMap cache fallback when `cache.url == ""` (Tier-1b, PR #60) |
 |  | `xiaoguai-auth` | OIDC verify, Casbin enforcer |
 |  | `xiaoguai-audit` ★ | HMAC chain, PII redactor, OTel decorator; **per-framework compliance export module (SOC2 CC7.2 / GDPR Art. 30 / HIPAA §164.312, PR #74, T5)** |
-| LLM + MCP | `xiaoguai-llm` ★ | LlmRouter, 8 provider backends, UsageSink, conservative `token_count` estimator (PR #66) |
+| LLM + MCP | `xiaoguai-llm` ★ | LlmRouter, **9 provider backends** (ollama, openai_compat, anthropic, gemini, bedrock, azure_openai, mistral, groq, **minimax** — DEC-024), UsageSink, conservative `token_count` estimator (PR #66) |
 |  | `xiaoguai-mcp` ★ | MCP client, supervisor, transports; **outbound OAuth 2.1 PKCE auth module + `TokenStore` (PR #73, T4)** |
 |  | `xiaoguai-mcp-exec` ★ | Sandboxed Python `execute_python` server |
 |  | `xiaoguai-mcp-exec-js` ★ | **Sandboxed JavaScript `execute_javascript` server, Deno default (PR #75, T6); separate trust boundary** |
@@ -346,6 +346,42 @@ Burn-rate alerts (per SRE workbook): fast-burn (1-hour window) and slow-burn (6-
 **Rationale:** Each item is small individually but together they finish the v1.5.x line. Splitting across PRs avoids one mega-PR while keeping the scope coherent under one sprint heading.
 
 **Refines:** DEC-014 (T3 production wiring), DEC-015 (T4 refresh-token), DEC-016 (T5 PDF), DEC-017 (T6 wiring).
+
+### DEC-024 — MiniMax LLM provider as dedicated backend, NOT via OpenAiCompatBackend
+
+**Statement:** Add `MinimaxBackend` as a new sibling of `GroqBackend` / `MistralBackend` in `crates/xiaoguai-llm/`, **not** via the existing `OpenAiCompatBackend` configured with a custom `base_url`. The backend targets the OpenAI-compatible endpoint `https://api.minimax.io/v1` (which MiniMax stably maintains), supports the `M1` / `M2.x` / `abab` model families, and **passes through `reasoning_content`** from M1-and-up thinking-mode responses without flattening it into `content`.
+
+```rust
+pub struct MinimaxBackend {
+    api_key: String,
+    base_url: String,           // default "https://api.minimax.io/v1"
+    http: reqwest::Client,
+}
+
+impl MinimaxBackend {
+    pub fn new(api_key: impl Into<String>) -> Self;
+    pub fn with_base_url(self, url: impl Into<String>) -> Self;
+}
+
+impl LlmBackend for MinimaxBackend {
+    async fn chat_stream(&self, req: ChatRequest) -> Result<ChatStream, LlmError>;
+    fn name(&self) -> &'static str { "minimax" }
+}
+```
+
+Seed migration `0023_minimax_provider_seed.sql` adds one row to `llm_providers` with `kind='minimax'`, `enabled=false` (operator opt-in), `models=['MiniMax-M1', 'MiniMax-M2', 'MiniMax-M2.5', 'MiniMax-M2.7', 'abab6.5-chat']`.
+
+**Rationale (3 reasons it's NOT a thin OpenAiCompat wrapper):**
+
+1. **`reasoning_content` field** on the response delta — present on M1/M2/M2.5/M2.7 streaming chunks for thinking-mode runs. `OpenAiCompatBackend` ignores this field. We want to expose it to downstream consumers (the agent loop, OTel spans, audit). A new field on `ChatChunk { reasoning_delta: Option<String> }` lands in `xiaoguai-types`, and `MinimaxBackend` is the first writer.
+2. **Model alias mapping is provider-specific.** MiniMax names models with a `-highspeed` suffix variant (`MiniMax-M2.7-highspeed` vs `MiniMax-M2.7`). The user-facing alias resolution belongs in the provider, not in `OpenAiCompatBackend`'s generic path.
+3. **MiniMax publishes an Anthropic-compatible endpoint** as a recommended alternative. Today we use OpenAI-compatible (more stable wire format) but the dedicated crate gives us the option to migrate without disturbing existing OpenAI-compat users.
+
+**Rejected alternative — `OpenAiCompatBackend` with `base_url=https://api.minimax.io/v1`:** zero new code, but drops `reasoning_content` and forces operators to repeat model lists in config. Acceptable as a fallback if `MinimaxBackend` is unavailable, documented in the runbook.
+
+**Refines:** the existing 8-backend `LlmRouter` family (now 9: ollama, openai_compat, anthropic, gemini, bedrock, azure_openai, mistral, groq, **minimax**); R.E.S.T Efficiency (per-tenant provider routing); §16 metrics gets `xiaoguai_llm_reasoning_tokens_total{provider,model}` for cost attribution of thinking-mode traffic.
+
+**Sprint placement:** lands in sprint-8 hardening track as task S8-10 (alongside DEC-023 follow-ups). Not blocking on the L3 pipeline.
 
 ---
 
