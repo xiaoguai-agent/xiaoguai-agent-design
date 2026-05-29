@@ -420,7 +420,7 @@ tasks"* — matches our observed production patterns.
 | L1 (Python) | Process isolation (`ulimit`, env scrub, tempdir) | `xiaoguai-mcp-exec` (#64). Adequate for trusted-tenant internal code. |
 | L1 (JavaScript) | Process isolation + Deno `--allow-none` | `xiaoguai-mcp-exec-js` (#75, T6). Separate trust boundary from Python — see DEC-017. |
 | L2 | Container isolation (Docker, containerd) | Operator can wrap L1 binaries in a container for additional isolation; not the default. |
-| L3 | wasmtime + pyodide (Python) / wasmtime + QuickJS-WASM (JS) | **Decision committed in ADR-0020 (PR #76).** Implementation deferred 2–3 sprints. Sibling crate `xiaoguai-mcp-exec-wasm` will extract an `ExecBackend` trait from the L1 crates and become an opt-in via tenant config. |
+| L3 | wasmtime + pyodide (Python) / wasmtime + QuickJS-WASM (JS) | **In flight — sprint-8 implementation track.** Decision committed in ADR-0020 + DEC-018/019/020. `ExecBackend` trait extraction (DEC-019) + new crate `xiaoguai-mcp-exec-wasm` (DEC-020) being implemented now. Per-tenant `sandbox_tier` selector lands alongside. Expected v1.6.0 ship. |
 | L4 | Full VM (KVM/QEMU) | Not planned. Cost outweighs benefit for the target deployment shape. |
 
 **Trade.** L1 is *fast* (3 ms cold start Python; ~10 ms JS due to Deno
