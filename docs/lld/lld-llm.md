@@ -114,6 +114,36 @@ pub fn estimate_message_tokens(messages: &[Message]) -> usize;
 
 Tests: 8 unit tests covering empty string, sub-token rounds-up boundary, CJK width, per-message overhead, tool-call aggregation, tool-role id overhead, multi-message sum, realistic 200-char paragraph.
 
+### 4.4 MiniMax backend with reasoning-content passthrough (v0.5.4.3, DEC-024, PR #79)
+
+`crates/xiaoguai-llm/src/minimax.rs` adds the 9th provider backend. Mirrors `GroqBackend`'s pattern (clean OpenAI-compatible reference) but explicitly **not** a wrapper around `OpenAiCompatBackend` — per DEC-024 there are three reasons that route would silently drop critical functionality:
+
+```rust
+pub struct MinimaxBackend {
+    api_key: String,
+    base_url: String,           // default "https://api.minimax.io/v1"
+    http: reqwest::Client,
+}
+
+impl MinimaxBackend {
+    pub fn new(api_key: impl Into<String>) -> Self;
+    pub fn with_base_url(self, url: impl Into<String>) -> Self;
+}
+
+impl LlmBackend for MinimaxBackend {
+    fn name(&self) -> &'static str { "minimax" }
+    async fn chat_stream(&self, req: ChatRequest) -> Result<ChatStream, LlmError>;
+}
+```
+
+Endpoint: `POST {base_url}/chat/completions` (OpenAI-compatible). Auth: `Authorization: Bearer {api_key}`.
+
+**Reasoning content passthrough** — the M1/M2/M2.5/M2.7 thinking-mode models emit `reasoning_content` in their streaming deltas alongside `content`. We surface this via a new `ChatChunk.reasoning_delta: Option<String>` field added in `crates/xiaoguai-llm/src/types.rs`. The other 8 backends leave it `None` (graceful degrade — no breaking change to their behaviour). Token attribution: `xiaoguai_llm_reasoning_tokens_total{provider, model}` counter increments per chunk so operators can track thinking-mode cost separately from output cost.
+
+Seed migration `0023_minimax_provider_seed.sql` adds one `llm_providers` row with `kind='minimax'`, `enabled=false`, `models=['MiniMax-M1', 'MiniMax-M2', 'MiniMax-M2.5', 'MiniMax-M2.7', 'abab6.5-chat']`. Default-disabled means no surprise outbound traffic.
+
+Tests: 5 mockito-backed integration tests covering content passthrough, reasoning_delta capture, abab6.5-chat null-reasoning path (model doesn't emit thinking), 401 unauthorized handling, and the `xiaoguai_llm_reasoning_tokens_total` counter increment.
+
 ## 5. Error handling
 
 ```rust

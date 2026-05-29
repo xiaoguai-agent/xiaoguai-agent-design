@@ -12,7 +12,32 @@ Standalone MCP server binary that exposes the `execute_python` tool. It is a sep
 
 **Sibling crate**: `xiaoguai-mcp-exec-js` (PR #75, T6, DEC-017) ships the same L1 contract for JavaScript via Deno (default) or Node. See [`lld-mcp-exec-js.md`](lld-mcp-exec-js.md). The two crates intentionally share NO code at the binary boundary so a CVE in either language runtime cannot compose. The shared L1 contract (env scrub allow-list, ulimit, tokio deadline, output cap, redaction) lives in PHILO §14.
 
-**Future L3 path**: per ADR-0020, the wasmtime+pyodide implementation will extract an `ExecBackend` trait from this crate's `sandbox.rs`; L1 becomes the default impl and `WasmtimeBackend` becomes an opt-in via a new sibling crate `xiaoguai-mcp-exec-wasm`. Implementation deferred 2–3 sprints.
+**L3 path now shipping**: per ADR-0020, the wasmtime+pyodide / wasmtime+QuickJS-WASM implementation lives in a new sibling crate [`xiaoguai-mcp-exec-wasm`](lld-mcp-exec-wasm.md). This crate's `runtime` module (added in sprint-8 PR #78) defines the `ExecBackend` trait; `ProcessL1Python` is the L1 default impl; the wasm crate's `WasmtimePythonBackend` is an opt-in alternative wired in at `ExecServer::with_backend(cfg, backend)`.
+
+## `ExecBackend` trait <a id="exec-backend-trait"></a>
+
+Defined in `crates/xiaoguai-mcp-exec/src/runtime.rs` (sprint-8 PR #78, DEC-019). The L1 default `ProcessL1Python` is constructed by `ExecServer::new(cfg)`; the L3 alternative (`WasmtimePythonBackend` from the sibling crate) is constructed via `ExecServer::with_backend(cfg, backend)` in the L3-binary `main.rs`.
+
+```rust
+#[async_trait]
+pub trait ExecBackend: Send + Sync {
+    /// Stable name, used in metrics labels and logs. Must NOT change
+    /// between versions — operators key dashboards off it.
+    fn name(&self) -> &'static str;          // e.g. "process-l1-python", "wasmtime-l3-python"
+
+    /// Run `snippet` with the per-call wall-clock `timeout`. The backend
+    /// is free to clamp the timeout against its own internal cap.
+    async fn run(&self, snippet: &str, timeout: Duration) -> Result<ExecResult, ExecError>;
+
+    /// Static summary of what this backend exposes to snippets. Used by
+    /// the MCP tool description so agents can route by capability.
+    fn capability_summary(&self) -> CapabilitySummary;
+}
+```
+
+The trait is **re-defined in each L1 crate** (Python + JavaScript) rather than centralised in a shared utility crate. Per the §6 plan-adjustment in `docs/plans/2026-05-30-sprint8-track-a-l3-sandbox.md`, this keeps the two trust boundaries physically independent — a CVE in the shared crate would not silently compromise both language paths.
+
+`CapabilitySummary` (`tier`, `language`, `network`, `filesystem`, `subprocess`, `max_memory_mb`, `max_timeout_secs`) is surfaced to the LLM via the tool description so agents can route around capability gaps ("L3 has no subprocess; call the L1 tool name instead").
 
 ## 2. Public interface
 

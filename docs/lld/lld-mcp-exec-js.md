@@ -13,6 +13,10 @@
 
 Standalone MCP server binary that exposes the `execute_javascript` tool. Sibling crate to [`lld-mcp-exec.md`](lld-mcp-exec.md) for the Python path. The crates share **no code at the binary boundary** by design — see DEC-017 for the trust-isolation rationale.
 
+**L3 path now shipping**: per ADR-0020 + DEC-020, the wasmtime + QuickJS-WASM backend lives in [`xiaoguai-mcp-exec-wasm`](lld-mcp-exec-wasm.md). This crate's `runtime` module (added in sprint-8 PR #78) defines `ExecBackend` and provides the L1 default `ProcessL1JavaScript`; the L3 binary `xiaoguai-mcp-exec-wasm-js` constructs `WasmtimeJavaScriptBackend` and passes it to `ExecServer::with_backend(cfg, backend)`.
+
+The trait surface is documented in [`lld-mcp-exec.md` § ExecBackend trait](lld-mcp-exec.md#exec-backend-trait). It is **re-defined in this crate too** (not imported from a shared utility) per the trust-boundary argument.
+
 Default JavaScript runtime is **Deno** (`--allow-none` for capability-denied execution); `--runtime node` is an operator opt-in. The choice is documented in `docs/designs/tier2-mcp-exec-js.md`; rejected alternative `boa_engine` is also recorded there.
 
 ## 2. Public interface

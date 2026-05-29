@@ -158,7 +158,31 @@ pub fn render(bundle: &ExportBundle, format: OutputFormat) -> Result<Vec<u8>, Ex
 
 **Architecture (cross-crate):** the new `AuditChainExporter` trait lives in `xiaoguai-api` (not in `xiaoguai-audit`) so the api crate can be constructed without the HMAC signing key. `xiaoguai-core::PgAuditAdapter` implements the trait by combining `PgAuditSink` (knows the key) + chain verification. Same bridge pattern as the existing `AuditReader` / `AuditVerifier`.
 
-**Output formats**: JSON is canonical. CSV is a deterministic projection with identical row counts and column semantics (just flat). PDF returns `PdfUnimplemented` → HTTP 501; tracked as a follow-up PR.
+**Output formats**: JSON is canonical. CSV is a deterministic projection with identical row counts and column semantics (just flat). PDF was originally stubbed (`PdfUnimplemented` → HTTP 501) — see §4.5 below for the sprint-8 implementation.
+
+### 4.5 PDF rendering via `pdf-writer` (v0.5.4.3, DEC-023.2, PR #79)
+
+`crates/xiaoguai-audit/src/pdf.rs` replaces the `PdfUnimplemented` stub with a `pdf-writer`-based renderer.
+
+**Plan adjustment recorded in PR #79's S8-6 commit**: the original DEC-023.2 statement specified `typst` (full typesetting engine with `.typ` templates). Sub-agent pivoted to `pdf-writer` (low-level PDF byte-emit library) on inspection of the actual requirements:
+
+- Templates are 4-5 fixed tables per framework + a `ChainProof` header. Not the use case a typesetting engine is designed for.
+- Typst defaults to embedding `datetime.now()` and a random `/ID` in the trailer; suppressing both requires hacks. `pdf-writer` is deterministic by construction.
+- DEC-016's commitment is "auditors verify byte-for-byte reproducibility". `pdf-writer` makes that a structural property, not a configuration discipline.
+
+The DEC-023.2 promise (auditor reproducibility) is preserved; only the implementation library changed.
+
+```rust
+pub fn render_pdf(bundle: &ExportBundle) -> Result<Vec<u8>, ExportError>;
+```
+
+Output structure: PDF 1.7 with deterministic `/CreationDate`, no random `/ID`, no embedded fonts (Helvetica via PDF standard 14). Per framework:
+
+- SOC2 CC7.2: tables for system-event-monitoring evidence + chain-proof footer.
+- GDPR Art. 30: records of processing activity with per-row `actor` / `purpose` / `data_categories`.
+- HIPAA §164.312: audit-controls table with five-W projection.
+
+Tests: 6 tests covering `%PDF-` header sniff, byte-determinism per framework (regenerate twice → equal), empty-bundle path, framework-label-in-footer.
 
 ## 5. Error handling
 
