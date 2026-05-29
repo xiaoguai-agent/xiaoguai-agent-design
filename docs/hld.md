@@ -55,9 +55,9 @@
 
 ---
 
-## 2. Module map (32 crates)
+## 2. Module map (32 crates + 4 frontend packages)
 
-Grouped by domain. Crate names are the source of truth; one LLD per starred (★) crate ships alongside this HLD.
+Grouped by domain. Crate names are the source of truth; one LLD per starred (★) crate ships alongside this HLD. Frontend packages live in `frontend/` (pnpm monorepo) and have their own LLDs — see [`lld/lld-admin-ui.md`](lld/lld-admin-ui.md), [`lld/lld-chat-ui.md`](lld/lld-chat-ui.md).
 
 | Domain | Crate | Role |
 |---|---|---|
@@ -87,6 +87,10 @@ Grouped by domain. Crate names are the source of truth; one LLD per starred (★
 | Other | `xiaoguai-personas` ★ | Role presets, persona-scoped memory views |
 |  | `xiaoguai-tasks` ★ | Kanban board, auto-dispatcher; **`skill_author` module (manifest validator + `propose/approve/reject` lifecycle, PR #72, T3)** |
 |  | `xiaoguai-observability` | OTel + Prometheus exporters |
+| Frontend (`frontend/` pnpm monorepo) | `@xiaoguai/admin-ui` ★ | Operator-facing SPA — 16 panes (Today / Audit / Scheduler / Eval / Usage / Outcomes / Anomaly / Kanban / Marketplace / Skills / McpServers / Tenants / Providers / HotlPolicies / Memory + sprint-10b Personas + SkillProposals); React 18 + Vite + TS + recharts + i18next |
+|  | `@xiaoguai/chat-ui` ★ | End-user SPA — chat surface with SSE streaming, HotL pending inline panel, watch indicator, EU AI Act disclosure banner; React 18 + Vite + TS |
+|  | `@xiaoguai/shared` | Type-safe `XiaoguaiClient` (mirrors all `xiaoguai-types` wire types); ~1600 LOC client + SSE consumer; one source of truth for both SPAs |
+|  | `@xiaoguai/e2e` | Playwright multi-browser matrix (Chrome / Firefox / Safari) covering chat-ui + admin-ui + scheduler golden paths |
 
 `xiaoguai-core` exists as a legacy entry point for systemd / .deb compatibility (PR #59 unified binary). New deployments use `xiaoguai serve`.
 
@@ -382,6 +386,31 @@ Seed migration `0023_minimax_provider_seed.sql` adds one row to `llm_providers` 
 **Refines:** the existing 8-backend `LlmRouter` family (now 9: ollama, openai_compat, anthropic, gemini, bedrock, azure_openai, mistral, groq, **minimax**); R.E.S.T Efficiency (per-tenant provider routing); §16 metrics gets `xiaoguai_llm_reasoning_tokens_total{provider,model}` for cost attribution of thinking-mode traffic.
 
 **Sprint placement:** lands in sprint-8 hardening track as task S8-10 (alongside DEC-023 follow-ups). Not blocking on the L3 pipeline.
+
+### DEC-025 — Frontend is a pnpm monorepo of two independent SPAs sharing one type-safe client
+
+**Statement:** `frontend/` is a **pnpm workspace** containing four packages:
+
+| Package | Role | Tech |
+|---|---|---|
+| `@xiaoguai/admin-ui` | Operator SPA (audit / scheduler / eval / HotL policies / kanban / personas / skill-proposals / …) | React 18 + Vite + TS + recharts + i18next |
+| `@xiaoguai/chat-ui` | End-user SPA (chat surface, SSE streaming, HotL pending, watch indicator, AI disclosure) | React 18 + Vite + TS + react-markdown + i18next |
+| `@xiaoguai/shared` | Type-safe `XiaoguaiClient` mirroring `xiaoguai-types` wire DTOs; SSE consumer; ApiError discriminated union | TS only, no UI framework |
+| `@xiaoguai/e2e` | Playwright multi-browser test harness | Playwright 1.48 |
+
+Five sub-decisions that follow from the dual-SPA split:
+
+1. **Two SPAs, not one shell.** Admin-ui and chat-ui are independent build artefacts on separate dev ports (`:5174` admin, `:5173` chat). Rationale: trust boundary — end users (chat-ui) and operators (admin-ui) never share a frontend security context; an XSS in one cannot pivot into the other.
+2. **One client, one type system.** `@xiaoguai/shared::XiaoguaiClient` is the **only** HTTP layer; both SPAs import it. No second SDK, no per-pane fetch. The wire types are TypeScript mirrors of `xiaoguai-types` Rust DTOs — a contract change in Rust forces a TypeScript change.
+3. **No login page in either SPA.** Authentication is delegated to the surrounding reverse proxy / OIDC (Kong, nginx with `oauth2-proxy`, corporate SSO). The SPA receives a bearer token via injected `Authorization` header and reads it from `VITE_API_URL` env config. On 401 → redirect to `VITE_LOGIN_URL`. Rationale: air-gapped enterprise deployments already standardise on SSO at the proxy; one OIDC integration in the proxy is safer than two OIDC integrations in the SPAs.
+4. **State is pane-local + URL.** No Redux/Zustand/global store. Each pane uses `useState`/`useReducer`; cross-pane state (tenant context) is the URL. Rationale: 16-pane SPA; global store invites cross-feature coupling and complicates the trust boundary between admin and chat (a global store would tempt sharing).
+5. **RBAC scope hints are UX-only.** `<RequireScope name="…">` hides actions when the operator lacks the scope, but fails open if `/v1/admin/me/scopes` is unavailable (older backend). Enforcement remains in backend Casbin (PHILO §17 anti-pattern: never trust a frontend gate for security).
+
+**Rationale:** The frontend has been growing organically for months under feature PRs (chat-ui Gemini-style welcome, admin-ui Kanban, anomaly dashboard, HotL editor) without an architectural anchor. DEC-025 retro-actively encodes the choices that have been working, and declares the trust boundary between the two SPAs explicit. The split-vs-merge question is decided in favour of split because the threat model — operator vs end user vs malicious tool output — is fundamentally different in each surface.
+
+**Refines:** R.E.S.T Security (operator/end-user surface separation), R.E.S.T Reliability (composer-doesn't-block, partial-bubble-preservation in chat-ui), DEC-006 (HotL gate has a first-class UI surface, not an admin afterthought), DEC-014 (skill proposals get an approval pane).
+
+**Adds:** `lld/lld-admin-ui.md`, `lld/lld-chat-ui.md`, sprint-10b task line in roadmap §4, PRD §4.14 UI requirements, test-spec §3.14 UI golden-path cases.
 
 ---
 

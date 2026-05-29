@@ -17,6 +17,8 @@ This directory contains the low-level design for each starred crate in [`hld.md`
 | `xiaoguai-im-gateway` | [`lld-im-gateway.md`](lld-im-gateway.md) | Core + API + Event |
 | `xiaoguai-personas` | [`lld-personas.md`](lld-personas.md) | Core + Storage |
 | `xiaoguai-observability` (SLO module) | [`lld-observability.md`](lld-observability.md) | Core + Async + Observability |
+| `@xiaoguai/admin-ui` | [`lld-admin-ui.md`](lld-admin-ui.md) | Frontend (React + Vite + TS) |
+| `@xiaoguai/chat-ui` | [`lld-chat-ui.md`](lld-chat-ui.md) | Frontend (React + Vite + TS) |
 
 All LLDs share the upstream baseline:
 
