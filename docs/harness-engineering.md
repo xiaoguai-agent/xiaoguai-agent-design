@@ -483,9 +483,11 @@ We instrument across four buckets matching the article's framing:
 | Bucket | Xiaoguai metrics (Prometheus names) |
 |---|---|
 | Task effectiveness | `xiaoguai_task_success_total`, `xiaoguai_tool_use_correct_total`, `xiaoguai_instruction_followed_total`, `xiaoguai_skill_proposals_total{outcome}` (T3) |
-| Service quality | `xiaoguai_request_duration_seconds` (histogram, with first-token-time variant), `xiaoguai_error_total{kind=...}`, `xiaoguai_mcp_oauth_refresh_duration_seconds` (T4) |
+| Service quality | `xiaoguai_request_duration_seconds` (histogram, with first-token-time variant), `xiaoguai_error_total{kind=...}`, `xiaoguai_mcp_oauth_refresh_duration_seconds` (T4), `xiaoguai_slo_burn_rate{signal,window}` (DEC-022, sprint-10) |
 | Resource efficiency | `xiaoguai_tokens_consumed_total`, `xiaoguai_tool_calls_per_task`, `xiaoguai_llm_provider_cost_usd`, `xiaoguai_compaction_token_savings` |
 | Security & compliance | `xiaoguai_policy_denial_total`, `xiaoguai_security_incident_total`, `xiaoguai_audit_chain_break_total`, `xiaoguai_compaction_fallback_total`, `xiaoguai_audit_export_chain_broken_total` (T5), `xiaoguai_mcp_oauth_refresh_failed_total` (T4) |
+
+**SLO framing on Service quality (DEC-022, sprint-10).** The Service quality bucket is now framed as **SLO contracts**, not just observed metrics. Each user-facing capability has a published Service Level Objective on the four Google SRE golden signals (latency, traffic, errors, saturation); the SLO targets live declaratively in `docs/runbooks/slo.md` and are referenced by name from Prometheus alert rules. `xiaoguai_slo_burn_rate{signal,window}` is a gauge that publishes per-scrape distance-to-breach; two-window burn-rate alerts (fast 1 h + slow 6 h, per the SRE workbook) page through the existing alertmanager → PagerDuty/Slack/email pipeline — no new alerting plumbing. The detailed design lives in `lld/lld-observability.md`; Wave-3's `wave3-slo-*` groups in `prometheus-rules.yaml` are the prototype the API tier generalises. This is a frame-on-top of the four-bucket taxonomy — the buckets stay; SLOs make "is this deployment healthy?" mechanical rather than a judgement call.
 
 These drive iteration: when `task_success_total / task_started_total` drops
 on a model upgrade, we either revert or fix the planner. When
