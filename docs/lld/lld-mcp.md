@@ -130,6 +130,37 @@ Implementation choices (per DEC-015):
 
 CLI flow `xiaoguai mcp register --auth oauth2-pkce …` binds a `127.0.0.1:0/callback` listener with a single-route handler, prints the consent URL, waits ≤ 5 minutes for the redirect, validates `state`, exchanges the code synchronously, persists. No browser auto-open (works on headless servers).
 
+### 4.5 AES-GCM refresh-token encryption at rest (v0.5.4.3, DEC-023.1, PR #79)
+
+`crates/xiaoguai-mcp/src/auth/at_rest.rs` adds AES-256-GCM encryption for refresh tokens stored in `mcp_oauth_tokens`. Per DEC-023.1, **RLS handles tenant isolation; encryption-at-rest handles disk-snapshot threats** (a different concern).
+
+```rust
+pub struct TokenCipher {
+    primary: KeyHandle,                  // 32 bytes, base64url-encoded
+    secondary: Option<KeyHandle>,        // dual-key window for rotation
+}
+
+impl TokenCipher {
+    /// Load from env. Refuses to start if XIAOGUAI_MCP_OAUTH_TOKEN_KEY
+    /// is missing AND any mcp_oauth_tokens row exists. Allowed on fresh
+    /// installs (no rows).
+    pub fn from_env(pool: &PgPool) -> Result<Option<Self>, AtRestError>;
+
+    /// Wrap-then-store. The envelope format is:
+    ///   version_byte (0x01) || nonce (12B) || ciphertext || gcm_tag (16B)
+    /// stored base64url-no-pad in `refresh_token_encrypted BYTEA`.
+    pub fn encrypt(&self, plaintext: &str) -> Result<Vec<u8>, AtRestError>;
+
+    /// Decrypt. Tries `primary` first, then `secondary` for the rotation
+    /// window. GCM-tag-mismatch surfaces as `AtRestError::TamperDetected`.
+    pub fn decrypt(&self, envelope: &[u8]) -> Result<String, AtRestError>;
+}
+```
+
+Key rotation mirrors `xiaoguai-audit::signing_key`'s dual-key pattern — operator sets `XIAOGUAI_MCP_OAUTH_TOKEN_KEY_OLD` while rotating; new writes use the primary, reads accept either. Once all rows are re-encrypted (operator-driven backfill), the old key env can be removed.
+
+**Migration `0024_mcp_oauth_token_encryption.sql`** adds a `refresh_token_encrypted BYTEA` column alongside the original `refresh_token TEXT`. New writes populate only the encrypted column; reads prefer encrypted then fall back to plaintext for backwards compatibility during operator backfill. A future migration drops the plaintext column once all rows are encrypted.
+
 ## 5. Error handling
 
 ```rust
@@ -143,6 +174,7 @@ pub enum McpError {
     SignatureMismatch,    // for signed marketplace packs
     AuthRequired,         // v0.5.4.2 — OAuth flow not yet completed for this (server, tenant)
     AuthFailed(String),   // v0.5.4.2 — token refresh / exchange failed
+    AtRestError(at_rest::AtRestError),  // v0.5.4.3 — token encryption/decryption / refuse-to-start
 }
 ```
 

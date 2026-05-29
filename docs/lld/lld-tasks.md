@@ -55,6 +55,33 @@ pub trait SkillProposalRepository: Send + Sync {
 #[async_trait]
 pub trait TenantSettingsReader: Send + Sync {
     async fn allow_skill_authoring(&self, tenant_id: &str) -> Result<bool>;
+
+    /// DEC-019 (sprint-8 S8-4): per-tenant sandbox tier. Used by the
+    /// MCP supervisor in `xiaoguai-core` to decide which exec-server
+    /// binary to spawn for this tenant (`xiaoguai-mcp-exec` /
+    /// `xiaoguai-mcp-exec-js` for L1, `xiaoguai-mcp-exec-wasm-py` /
+    /// `xiaoguai-mcp-exec-wasm-js` for L3). Defaults to L1 (safe per
+    /// PHILO §14) when the tenant has no explicit setting.
+    async fn sandbox_tier(&self, tenant_id: &str) -> Result<SandboxTier>;
+}
+
+/// Sandbox tier for code-execution MCP servers (DEC-019). Operators
+/// set this per tenant via `tenant_settings.settings->>'sandbox_tier'`
+/// (JSONB — no schema migration needed). L1 = process isolation, L3 =
+/// wasmtime capability sandbox. L2 (container) and L4 (full VM) are
+/// not surfaced through this enum; operators wrap L1/L3 binaries in
+/// containers themselves if needed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SandboxTier { L1, L3 }
+
+impl SandboxTier {
+    /// Parse the stored string ("L1" / "L3"; case-insensitive). Unknown
+    /// values fall back to L1 (safe default per PHILO §14).
+    pub fn from_str_lenient(s: &str) -> Self;
+
+    /// Stable label for metrics / dashboards — must NOT change between
+    /// versions.
+    pub fn as_str(self) -> &'static str;
 }
 
 #[async_trait]
