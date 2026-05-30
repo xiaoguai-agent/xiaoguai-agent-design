@@ -217,13 +217,14 @@ When tampering is detected `valid=false, broken_at_sequence=<n>` is set. No auto
 
 Each job has at most one trigger plus one or more push sinks.
 
-### 2.6 HotL policies
+### 2.6 HotL policies + decisions
 
 | Method | Path | Description | Verifies |
 |---|---|---|---|
 | `GET` | `/v1/hotl/policies` | List HotL policies for caller's tenant | REQ-HOTL-004 |
 | `POST` | `/v1/hotl/policies` | Create or upsert a policy | REQ-HOTL-001 |
 | `DELETE` | `/v1/hotl/policies/{id}` | Delete a policy | REQ-HOTL-004 |
+| `POST` | `/v1/hotl/decisions` | Record an operator verdict on a pending escalation; optionally raise a policy in the same transaction | REQ-HOTL-002, REQ-HOTL-003 |
 
 #### 2.6.1 Policy shape
 
@@ -239,6 +240,90 @@ Each job has at most one trigger plus one or more push sinks.
   "enabled": true
 }
 ```
+
+#### 2.6.2 Decision shape (`POST /v1/hotl/decisions`)
+
+Operator verdicts on escalated tool calls. Sprint-11 (S11-3a.1) ships the **record-only** path; sprint-12 (S11-3a.2) flips the `resumed` field to dynamic when a suspended agent loop is waiting.
+
+Request:
+
+```json
+{
+  "request_id": "uuid",          // also accepted as "escalation_id" (deprecated alias, sprint-13 removal)
+  "verdict": "allow",            // "allow" | "deny"
+  "decided_by": "ops@acme.com",  // sprint-12: ignored when Claims carries a subject
+  "raise_policy": {              // optional — "Approve & remember" UX
+    "scope": "tool_call.execute_python",
+    "window_secs": 3600,
+    "max_count": 50,
+    "max_spend_usd": "10.00",
+    "rationale": "Pre-approved for incident #4421"
+  }
+}
+```
+
+Response (`201 Created`):
+
+```json
+{
+  "id": "uuid",                  // decision row id
+  "request_id": "uuid",
+  "verdict": "allow",
+  "recorded_at": "2026-05-30T08:12:34Z",
+  "resumed": false,              // sprint-11: always false (no waiter exists, loop never suspended).
+                                 // sprint-12 (S11-3a.2): true when DecisionRegistry resolved a live oneshot
+                                 // waiter; false when the decision arrived after the loop already timed out
+                                 // or the agent was never suspended (e.g. policy returned Allow client-side).
+  "policy_created": {            // present iff raise_policy was supplied AND policy was created in-tx
+    "id": "uuid",
+    "scope": "tool_call.execute_python",
+    "max_count": 50,
+    "enabled": true
+  }
+}
+```
+
+Status codes:
+
+| Code | When |
+|---|---|
+| `201 Created` | Decision recorded (`resumed` may be `true` or `false`). |
+| `401 Unauthorized` | Bearer missing or invalid. |
+| `403 Forbidden` | Missing `hotl:decide` scope (sprint-11 uses a path-based fallback; sprint-12 onwards uses the dedicated Casbin rule). |
+| `404 Not Found` | Unknown `request_id` (S11-3a.1 has no parent `hotl_escalations` table; sprint-12 adds it and tightens this check). |
+| `409 Conflict` | Duplicate decision for the same `request_id`. Operators must inspect the existing record. |
+| `503 Service Unavailable` | `HotlDecisionStore` not wired in production `AppState` (default until S11-3a.2's PG impl + DecisionRegistry land). |
+
+#### 2.6.3 SSE events — `hotl_pending` and `hotl_resolved`
+
+Two SSE event variants on the chat message stream (`POST /v1/sessions/{id}/messages`, `Accept: text/event-stream`). Both are sprint-12 additions; sprint-11 has neither (the agent loop does not suspend — see [`lld-agent.md`](lld/lld-agent.md) §4.5).
+
+`hotl_pending` — emitted by `xiaoguai-agent` when `HotlGate::check` returns `Suspend`:
+
+```json
+{
+  "type": "hotl_pending",
+  "request_id": "uuid",
+  "tool": "execute_python",
+  "args_redacted": { "...": "policy-driven redaction" },
+  "scope": "tool_call.execute_python",
+  "expires_at": "2026-05-31T08:12:34Z"   // server-side timeout (24h default), same clock as decisions.recorded_at
+}
+```
+
+`hotl_resolved` — emitted by `xiaoguai-agent` after `DecisionRegistry` resolves the waiter (verdict from `POST /v1/hotl/decisions`) OR after the server-side timeout fires:
+
+```json
+{
+  "type": "hotl_resolved",
+  "request_id": "uuid",
+  "verdict": "allow",            // "allow" | "deny" | "timeout"
+  "decided_by": "ops@acme.com",  // omitted when verdict = "timeout"
+  "recorded_at": "2026-05-30T08:13:01Z"
+}
+```
+
+Frontend contract (cross-ref [`lld-chat-ui.md`](lld/lld-chat-ui.md) §4.3): on `hotl_pending`, render `<HotlBanner>` in the pending state. On `hotl_resolved`, clear the banner. Sprint-11's chat-ui has neither hook wired — it relies on an optimistic-clear timeout after a successful `POST /v1/hotl/decisions`; sprint-12 (S11-3a.2) removes that timeout and waits for `hotl_resolved` exclusively.
 
 ### 2.7 Skill packs
 
