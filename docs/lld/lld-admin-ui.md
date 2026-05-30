@@ -119,6 +119,16 @@ On "Export…" → POST /v1/audit/exports {framework: soc2|gdpr|hipaa}; SSE prog
 
 The pane shows the redaction state explicitly — an `<AbsenceMarker fields={['email','phone']} />` widget renders the placeholder positions so operators understand the chain signs the post-redaction payload (DEC-004, REQ-NFR-007).
 
+> **Sprint-11 status (2026-05-30) — drift to close.** As of v1.8.0 the implemented `frontend/admin-ui/src/panes/Audit.tsx` renders the id/ts/actor/action/resource/hmac columns only — it does **not** yet render `<ChainBadge>` and does **not** expose the Export action. The backend route `POST /v1/audit/exports` has been mounted since sprint-7 (PR #74); this is a UI-only gap. The `frontend/e2e/tests/admin-ui/admin-audit-export.spec.ts` Playwright spec carries `test.fixme()` placeholders for the two affected cases (`ChainBadge column reflects verified / amber / broken`, `Export button issues POST /v1/audit/exports and surfaces a Download ChainProof link`). Gap-close checklist owned by sprint-11 task **S11-1**:
+>
+> 1. `Audit.tsx` adds a `<ChainBadge prev_hmac hmac />` cell per row driven by the row's verify state.
+> 2. `Audit.tsx` adds an `<ExportButton>` wrapped in `<RequireScope name="audit.export">` (see §4.8).
+> 3. `XiaoguaiClient.createAuditExport({framework})` lands in `frontend/shared/src/index.ts`, returning the SSE export-progress URL alongside the export id.
+> 4. `Audit.tsx` subscribes to the export-progress SSE and renders a "Download ChainProof" anchor once `state === "complete"`.
+> 5. Flip the two `test.fixme()` markers off; they become the acceptance test for S11-1.
+>
+> No prose above this callout changes — the specification is correct and unchanged; only the implementation is catching up. **(Carry: refines DEC-LLD-ADMIN-UI-002 — the Export action is one of the affordances `<RequireScope>` gates.)**
+
 ### 4.3 Kanban pane — auto-dispatch + block (ADR-0019)
 
 Six fixed columns: `triage → todo → ready → running → blocked → done`. Drag handle calls `PATCH /v1/tasks/{id}/column`. Block button opens reason modal → `POST /v1/tasks/{id}/block`. Dispatch button on the board header → `POST /v1/tasks/dispatch?board=X` (server selects next eligible task per persona-budget rules).
@@ -214,7 +224,7 @@ artifact:
   status: draft
   owners: [engineering.xiaoguai]
   created_at: 2026-05-29
-  updated_at: 2026-05-29
+  updated_at: 2026-05-30
   source_documents: [HLD-XIAOGUAI-001, PRD-XIAOGUAI-001, API-XIAOGUAI-001]
 entities:
   requirements: []
