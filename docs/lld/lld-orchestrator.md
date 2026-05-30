@@ -132,6 +132,8 @@ run(PlanThenExecute{planner, executor}, req)
 
 Each peer's tool calls flow through HotL with `scope = "tool_call.<name>.persona.<persona_id>"` so personas with different trust levels can be budgeted separately. Default mode (single budget) is the no-suffix form.
 
+**Suspend interaction (sprint-12, S11-3a.2)** — when `SuspendingHotlGate` is active (see [`lld-agent.md`](lld-agent.md) §4.5), each suspended waiter is keyed by a freshly minted `request_id`, so cross-persona collision at the `DecisionRegistry` is impossible at the routing layer. The persona suffix determines **which policy fires** (and therefore whether the verdict is `Allow`/`Deny`/`Suspend`); it does not need to flow into the registry key. Operator UX (chat-ui `<HotlBanner>`, §4.3 of `lld-chat-ui.md`) shows the scope including the persona suffix so the reviewer knows which peer requested the tool call.
+
 ### 4.4 Planner-Worker-Critic triangle (v1.6+, DEC-021)
 
 The triangle is a structured loop: Planner emits a `Plan` of `Task`s, each `Task` runs through Worker → Critic. The Critic's verdict drives the next step.

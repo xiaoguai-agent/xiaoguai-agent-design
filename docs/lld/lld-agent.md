@@ -183,6 +183,135 @@ if let Some(cfg) = config.compaction {
 
 **Cross-references**: PHILO-XIAOGUAI-001 §11 (token transformation pipeline) and §12 (Function Calling lifecycle step 4 invariant) motivate the tool-pair guard. DEC-013 in HLD codifies the decision.
 
+### 4.5 HotL suspension wiring (sprint-12, S11-3a.2)
+
+> **Status:** new section added in sprint-12 design pass. Sprint-11 closed the chat-ui inline buttons + the `POST /v1/hotl/decisions` route (see [`lld-chat-ui.md`](lld-chat-ui.md) §4.3.1 and [`api-contract.md`](../api-contract.md) §2.6.2). This section specifies the agent-side wiring that flips the route's `resumed: false` seam to a live waiter.
+
+Sprint-11 shipped the seam: `EnforcerGate` maps upstream `HotlVerdict::Escalate` to `HotlGateVerdict::Allow` plus a `tracing::warn`. The loop **does not pause** on escalation — see `crates/xiaoguai-core/src/hotl_bridge.rs:361`. Operators reviewed pending escalations out-of-band; their decisions were recorded but had no live effect.
+
+Sprint-12 keeps that fall-through as the legacy compatibility path and adds a second adapter that **does** suspend. The choice between adapters is per-tenant (config flag `agent.hotl.suspend_on_escalate: bool`, default `false` in v1.8.x for backward compatibility, default `true` from v1.9 onwards).
+
+**Additive verdict variant** (extends `HotlGateVerdict` in `crates/xiaoguai-agent/src/hotl_gate.rs`):
+
+```rust
+pub enum HotlGateVerdict {
+    Allow,
+    Deny(String),
+    /// New (sprint-12). Loop must NOT dispatch the tool yet — it
+    /// must emit `AgentEvent::HotlPending`, then await `ticket.await`
+    /// to receive an operator verdict from `DecisionRegistry`.
+    Suspend {
+        request_id: Uuid,
+        scope: String,
+        ticket: HotlSuspensionTicket,
+    },
+}
+
+/// One-shot receiver paired with a sender held by `DecisionRegistry`
+/// on `AppState`. Future-like: awaits a `HotlDecisionVerdict { verdict, decided_by }`
+/// or times out at `expires_at` (24h default, configurable per scope).
+pub struct HotlSuspensionTicket { /* inner: oneshot::Receiver<...> + Instant */ }
+```
+
+The variant is **additive** — existing `EnforcerGate` keeps returning `Allow`/`Deny` and ignores the new path; only the new `SuspendingHotlGate` (in `xiaoguai-core::hotl_bridge`) ever emits `Suspend`. Adapter selection happens in `xiaoguai-core::run_serve` based on the config flag.
+
+**Additive `AgentEvent` variants** (extends `crates/xiaoguai-agent/src/event.rs`):
+
+```rust
+pub enum AgentEvent {
+    // ... existing variants ...
+
+    /// New (sprint-12). Tool dispatch paused; waiting on operator decision.
+    /// SSE wire shape: see api-contract §2.6.3.
+    HotlPending {
+        request_id: Uuid,
+        tool: String,
+        args_redacted: JsonValue,
+        scope: String,
+        expires_at: DateTime<Utc>,
+    },
+
+    /// New (sprint-12). Emitted after the ticket resolves (operator verdict
+    /// OR server-side timeout). Always follows a HotlPending with the same
+    /// `request_id`. The tool's eventual outcome appears as the normal
+    /// ToolCallFinished event that follows (when verdict = "allow") or as a
+    /// synthetic ToolCallFinished with ok=false (when verdict = "deny" / "timeout").
+    HotlResolved {
+        request_id: Uuid,
+        verdict: HotlResolution,   // Allow | Deny | Timeout
+        decided_by: Option<String>,
+        recorded_at: DateTime<Utc>,
+    },
+}
+```
+
+**Loop integration** — extends §4.1's `match gate_result` arm. The key design choice (DEC-LLD-AGENT-004 below): suspension blocks **within the existing iteration**, it does not introduce a new outer state machine.
+
+```
+iteration:
+  ...
+  if tool_calls present:
+    gated_calls = []
+    for call in tool_calls:
+      gate_result = hotl.check(tenant, scope=tool_call.<name>, amount=1)
+      match gate_result:
+        Allowed                     => gated_calls.push((Allowed, call))
+        Suspend{request_id, ticket} =>                                   # NEW (sprint-12)
+          emit HotlPending{request_id, tool, args_redacted, scope, expires_at}
+          match ticket.await:                                            # blocks the iteration
+            Ok(HotlDecisionVerdict{ Allow, decided_by }) =>
+              emit HotlResolved{request_id, verdict=Allow, decided_by, recorded_at=now}
+              gated_calls.push((Allowed, call))
+            Ok(HotlDecisionVerdict{ Deny(reason), decided_by }) =>
+              emit HotlResolved{request_id, verdict=Deny, decided_by, recorded_at=now}
+              synthesise failed ToolResult { error: reason }; do NOT dispatch
+            Err(Timeout) =>
+              emit HotlResolved{request_id, verdict=Timeout, decided_by=None, recorded_at=now}
+              synthesise failed ToolResult { error: "operator decision timed out" }
+            Err(Cancelled) =>                                            # cancellation registry fired
+              # do NOT emit HotlResolved (the cancel path emits Final(cancelled))
+              return
+        Escalated{ to } => synthetic_result + audit + push escalate channel  # legacy, suspend_on_escalate=false
+        Denied(reason)  => synthesise failed ToolResult
+        PolicyUnavailable => synthetic_result + audit + agent stops
+    futures = gated_calls.map(|c| toolbox.call(c)).join_all
+    ...
+```
+
+**Why block inside the iteration (not lift to an outer state machine)**:
+
+- The session is already serialised — §6 guarantees one loop per session. There is no concurrent work that suspension can starve.
+- Operator decisions are slow (seconds to hours), but so are LLM calls (seconds to minutes). The existing `await` discipline accommodates this. A separate state machine would have to re-derive the same per-tool-call locality the loop already owns.
+- The cancellation registry already covers the "operator never decides + user closes tab" case via the existing iteration-boundary poll plus a select between `ticket.await` and `cancel.observe()`. No new cancel surface.
+
+**DecisionRegistry** (lives on `AppState` in `xiaoguai-api`, depended on by both the route handler and the gate adapter — see `lld-chat-ui.md` §4.3 for the frontend contract):
+
+```rust
+pub struct DecisionRegistry {
+    waiters: DashMap<Uuid, oneshot::Sender<HotlDecisionVerdict>>,
+}
+
+impl DecisionRegistry {
+    /// Called by `SuspendingHotlGate::check` immediately before
+    /// returning `Suspend{...}`. Returns the receiver half wrapped
+    /// in a `HotlSuspensionTicket`.
+    pub fn register(&self, request_id: Uuid) -> HotlSuspensionTicket;
+
+    /// Called by `POST /v1/hotl/decisions` handler after recording
+    /// the decision. Returns `true` iff a live waiter consumed the verdict —
+    /// this is the value that flips the route's `resumed` response field
+    /// (see api-contract §2.6.2). Returns `false` when no waiter exists
+    /// (decision arrived late; race; or the loop was never suspended).
+    pub fn resolve(&self, request_id: Uuid, verdict: HotlDecisionVerdict) -> bool;
+}
+```
+
+**Timeout** — the gate adapter spawns a `tokio::time::sleep_until(expires_at)` companion future when it registers. On timeout, it sends a `HotlDecisionVerdict::Timeout` to the receiver and unregisters the entry. The route handler's `409 Conflict` semantics keep working: a late `POST /v1/hotl/decisions` after the timeout sees an empty registry and falls through to `resumed: false` + records the decision (the operator's intent is preserved in audit even if it had no live effect).
+
+**Persona suffix** — when the orchestrator runs multi-peer patterns, the gate scope already carries `.persona.<persona_id>` (see [`lld-orchestrator.md`](lld-orchestrator.md) §4.2). The `request_id` is freshly minted per-call so cross-persona collision is impossible at the registry layer. The persona suffix matters for **which policy fires**, not for waiter routing.
+
+**Test design**: see §7's "Integration" row — sprint-12 adds `hotl_suspend.rs` (suspend → resolve happy path), `hotl_suspend_timeout.rs` (no operator → timeout synthesises Deny), `hotl_suspend_cancel.rs` (user cancels mid-suspension → cancel wins over operator).
+
 ## 5. Error handling
 
 ```rust
@@ -208,7 +337,7 @@ pub enum AgentError {
 | Layer | Cases |
 |---|---|
 | Unit | `react.rs` state machine: one-shot reply, multi-tool reply, escalated reply, cancelled reply. `history.rs` slide: noop_when_under_window, drops_oldest_non_system, drops_dangling_tool_message_at_new_head, window_zero_is_unbounded. `history.rs` compact: compact_noop_when_under_keep_recent, compact_replaces_head_with_summary, compact_falls_back_to_slide_on_backend_error, compact_preserves_tool_pairing, should_compact_threshold. |
-| Integration | `hotl_escalate.rs` — exceeded budget yields synthetic result + audit row; `cancel.rs` — cancel mid-tool returns Final(cancelled) within slowest-tool-deadline. **`compaction_integration.rs`** (v0.5.4.1): `compaction_shrinks_large_history_via_summary` — 100-turn synthetic conversation with 30 tool-call cycles compacts to ≤ 50 % of `max_context_tokens`; `compaction_preserves_recent_turns_verbatim` — last 6 messages bit-identical post-compaction. |
+| Integration | `hotl_escalate.rs` — exceeded budget yields synthetic result + audit row; `cancel.rs` — cancel mid-tool returns Final(cancelled) within slowest-tool-deadline. **`compaction_integration.rs`** (v0.5.4.1): `compaction_shrinks_large_history_via_summary` — 100-turn synthetic conversation with 30 tool-call cycles compacts to ≤ 50 % of `max_context_tokens`; `compaction_preserves_recent_turns_verbatim` — last 6 messages bit-identical post-compaction. **Sprint-12 (S11-3a.2)**: `hotl_suspend.rs` — gate returns Suspend → loop emits HotlPending → registry.resolve(Allow) → loop emits HotlResolved + dispatches tool; `hotl_suspend_timeout.rs` — ticket times out → HotlResolved(Timeout) + synthetic Deny ToolResult; `hotl_suspend_cancel.rs` — cancellation registry fires during ticket.await → Final(Cancelled), no HotlResolved emitted. |
 | System | Test strategy L2: SSE event sequence shape; BEH-CHAT-001. Compaction metrics: `xiaoguai_compaction_triggered_total` increments per trigger; `xiaoguai_compaction_fallback_total / triggered` < 5 % in healthy deployments. |
 
 ## 8. Traceability metadata
@@ -231,12 +360,14 @@ entities:
   must_not_regress: []
   external_behaviors: []
   decisions:
-    - { id: DEC-LLD-AGENT-001, title: "HotL gate before tool spawn", statement: "Every tool call passes through HotlGate.check before dispatch.", status: approved, scope: in, decision: "Gate-first.", rationale: "Prevents budget evasion via fast-spawn races." }
+    - { id: DEC-LLD-AGENT-001, title: "HotL gate before tool spawn", statement: "Every tool call passes through HotlGate.check before dispatch. Verdicts are Allow / Deny / Suspend (sprint-12+); Suspend blocks the iteration on a DecisionRegistry ticket before either dispatching (Allow) or synthesising a failed ToolResult (Deny/Timeout).", status: approved, scope: in, decision: "Gate-first with optional in-iteration suspension.", rationale: "Prevents budget evasion via fast-spawn races; suspension keeps operator decisions on the same per-tool-call locality the loop already owns." }
     - { id: DEC-LLD-AGENT-002, title: "Cancel polled at boundaries", statement: "Cancellation polled at iteration and tool-call boundaries.", status: approved, scope: in, decision: "Coarse-grained cancel.", rationale: "Avoids mid-LLM-stream tear-down complexity." }
     - { id: DEC-LLD-AGENT-003, title: "Compaction deferred to Tier-2d", statement: "History compaction not implemented in v1.4.", status: approved, scope: in, decision: "Truncate-only for now.", rationale: "Compaction policy design is open (PRD Q5)." }
+    - { id: DEC-LLD-AGENT-004, title: "HotL suspension is in-iteration, not a new state machine", statement: "On HotlGateVerdict::Suspend the loop blocks within the existing iteration on a HotlSuspensionTicket (oneshot receiver + timeout) before dispatching tools, rather than lifting suspension to an outer state machine.", status: approved, scope: in, decision: "In-iteration await.", rationale: "Sessions are already serialised (one loop per session, §6); a separate state machine would re-derive the per-tool-call locality the loop already owns. Cancellation registry already covers the ‘operator never decides + user closes tab’ case via a select between ticket.await and cancel.observe()." }
   flows:
     - { id: FLOW-LLD-AGENT-001, title: "ReAct iteration with HotL", statement: "Stream LLM, gate tool calls, parallel dispatch, append history, loop or finalise.", status: approved, scope: in, kind: module_interaction }
     - { id: FLOW-LLD-AGENT-002, title: "Cancellation propagation", statement: "Registry poll at boundaries; bounded by slowest tool.", status: approved, scope: in, kind: state_transition }
+    - { id: FLOW-LLD-AGENT-003, title: "HotL suspend/resume (sprint-12)", statement: "On Suspend verdict emit HotlPending, await DecisionRegistry ticket (or timeout), emit HotlResolved, then dispatch or synthesise failed ToolResult based on operator verdict.", status: approved, scope: in, kind: module_interaction }
   test_cases: []
 relations:
   - { id: REL-LLD-AGENT-001, type: refines, from: DEC-LLD-AGENT-001, to: DEC-HLD-006, status: active }

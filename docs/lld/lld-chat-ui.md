@@ -114,15 +114,21 @@ If the user closes the tab during a pending verdict, the request stays open unti
 
 #### 4.3.1 In-conversation Approve / Deny — sprint-11 status
 
-> **Sprint-11 status (2026-05-30) — drift to close.** As of v1.8.0 `frontend/chat-ui/src/HotlBanner.tsx` renders only an informational banner with a "Review in approval queue →" link out to admin-ui — it does **not** yet expose the three inline action buttons (**Approve** / **Deny** / **Approve & remember**) specified above. The chat-ui SSE-handling code already pauses the streaming bubble on `hotl_pending`, so the gap is purely the inline affordances + `POST /v1/hotl/decisions` wiring. The `frontend/e2e/tests/chat-ui/chat-hotl-suspend-resume.spec.ts` Playwright spec carries a `test.fixme()` placeholder for the inline-decision case. Gap-close checklist owned by sprint-11 task **S11-3**:
+> **✅ Shipped in sprint-11 (xiaoguai PR #119, merged 2026-05-30, v1.8.1).** `frontend/chat-ui/src/HotlBanner.tsx` (57 → 293 LOC) now renders the three inline action buttons — Approve / Reject / Adjust — with idle, submitting, and error states. `XiaoguaiClient.submitHotlDecision({request_id, verdict, raise_policy?})` posts to `/v1/hotl/decisions` (backend route shipped in PR #118; S11-3a.1). 14 i18n keys × 3 locales. The "Review in approval queue →" link is preserved as an escape hatch. The `frontend/e2e/tests/chat-ui/chat-hotl-suspend-resume.spec.ts` placeholder was flipped off and now asserts the inline-approve path.
 >
-> 1. Promote `HotlBanner` to a `HotlPendingPanel` (or extend it) that renders the three buttons in the order Approve → Deny → Approve & remember; keep the existing "Review in approval queue →" link as a fall-through for operators who prefer the admin queue.
-> 2. Add `XiaoguaiClient.submitHotlDecision({request_id, verdict, raise_policy?})` in `frontend/shared/src/index.ts` posting to `/v1/hotl/decisions`.
-> 3. "Approve & remember" opens a small form to capture `{scope, tool}` and chains a `POST /v1/hotl/policies` call (admin endpoint, see §4.3 step 5); surface auth errors as a non-fatal toast — the inline panel must keep working when raising a policy fails.
-> 4. Optimistic UX: on Approve/Deny click, the panel switches to a "submitting…" state; the SSE replay's eventual `final` or `hotl_resolved` event clears the panel. Failure → revert to interactive + show error inside the panel.
-> 5. Flip the `test.fixme()` marker off in `chat-hotl-suspend-resume.spec.ts` (or split into a sibling `chat-hotl-inline-decision.spec.ts` as the e2e author noted) — it becomes the acceptance test for S11-3.
+> **Sprint-11 limitation (closed by §4.3.2 below).** The chat-ui clears the panel **optimistically** after a successful `POST /v1/hotl/decisions` because no `hotl_resolved` SSE event ever arrives — the backend's `EnforcerGate` does not suspend the agent loop on escalate, it logs and proceeds. Operator decisions are recorded for audit but have no live effect on the in-flight tool dispatch. The route's response includes `resumed: false` as the seam (see [`api-contract.md`](../api-contract.md) §2.6.2).
+
+#### 4.3.2 Suspend / resume wiring — sprint-12 status
+
+> **Sprint-12 status — drift to close (S11-3a.2).** As of v1.8.1 the chat-ui's `<HotlBanner>` clears its submitting state via a 5 s optimistic-clear timeout (see PR #119), because the backend never emits a `hotl_resolved` event — the loop does not suspend. Sprint-12 closes the loop end-to-end:
 >
-> The link-out behaviour stays as a tested fallback for operators on browsers where the SSE stream is unreliable; it is **not** removed. **(Carry: refines DEC-LLD-CHAT-UI-002 — the inline panel is still inline; sprint-11 fleshes out the affordances DEC-LLD-CHAT-UI-002 already specifies.)**
+> 1. Backend agent loop adopts `SuspendingHotlGate` (per-tenant config flag `agent.hotl.suspend_on_escalate`; default `false` in v1.8.x, `true` from v1.9). See [`lld-agent.md`](lld-agent.md) §4.5 + DEC-LLD-AGENT-004.
+> 2. Backend emits new SSE events `hotl_pending` (on Suspend verdict) and `hotl_resolved` (on operator verdict / timeout). See [`api-contract.md`](../api-contract.md) §2.6.3 for the wire shape.
+> 3. `frontend/shared/src/agentEventStream.ts` parses the two new event kinds and surfaces them via the `useStreamingMessage` reducer (unknown-event tolerance from §4.7 keeps older backends working — chat-ui just falls back to the sprint-11 optimistic-clear path).
+> 4. `<HotlBanner>` waits for `hotl_resolved` (matched by `request_id`) before clearing, **dropping the 5 s timeout**. If `hotl_resolved` arrives with `verdict: "timeout"`, the banner shows a "decision timed out — tool call denied" annotation. If the operator verdict from `POST /v1/hotl/decisions` and the `hotl_resolved` event disagree (e.g. network race + a sibling tab decided first), the SSE event wins and the local submitting state is reverted with a one-line conflict toast.
+> 5. New e2e `frontend/e2e/tests/chat-ui/chat-hotl-suspend-resume.spec.ts` cases: (a) approve → tool dispatches and result streams; (b) deny → tool is skipped, agent observes failed ToolResult and replies; (c) operator-via-admin-ui in a sibling tab → chat-ui's banner clears via the SSE event alone, no local POST.
+>
+> The optimistic-clear path remains as a defensive fallback when the SSE stream is interrupted between `submitHotlDecision()` succeeding and `hotl_resolved` arriving — the existing reconnect banner (§4.7.1) covers the gap. **(Carry: refines DEC-LLD-CHAT-UI-002 + the new DEC-LLD-AGENT-004 — the inline panel becomes truly resume-driven, not optimistic.)**
 
 ### 4.4 Watch indicator (BEH-CHAT-001 sibling)
 
@@ -155,15 +161,7 @@ The default text is the EU Commission's plain-language template; jurisdictions w
 
 #### 4.7.1 SSE reconnect banner — sprint-11 status
 
-> **Sprint-11 status (2026-05-30) — drift to close.** As of v1.8.0 `XiaoguaiClient.sendMessage()` in `frontend/shared/src/index.ts` calls `onError?(err)` on a stream/reader failure and stops; there is **no** automatic retry loop and **no** reconnect banner component. The partial-bubble-preservation property (DEC-LLD-CHAT-UI-003) already holds because the reader appends as it reads and never tears down the bubble on error; that case is covered by a passing e2e test. The `frontend/e2e/tests/chat-ui/chat-sse-reconnect.spec.ts` Playwright spec carries a `test.fixme()` placeholder for the reconnect-banner case. Gap-close checklist owned by sprint-11 task **S11-2**:
->
-> 1. `ChatPage` (or a small surrounding `<SseLifecycle>` component) exposes a banner UI hook rendered when the SSE stream is in a `reconnecting` state, with `data-testid="sse-reconnect-banner"` so the e2e assertion is stable.
-> 2. `XiaoguaiClient.sendMessage()` gains an internal retry loop: on a non-`AbortError` reader/network failure during streaming, sleep with exponential backoff (1 s, 2 s, 4 s, 8 s, 16 s; cap 30 s) and re-issue the POST with a `resume_from_sequence` parameter (or, if the backend cannot resume, restart the in-progress message — server-side dedup makes this safe). After 30 s with no success → emit `onError` with a `kind: "reconnect_failed"` `StreamError` and surface a manual retry button.
-> 3. The retry callback is observable: `sendMessage` accepts an optional `onReconnect?(attempt: number)` so `ChatPage` can flip the banner UI on/off.
-> 4. The reconnect path **must not** delete the partial bubble (DEC-LLD-CHAT-UI-003) — the reader keeps the same `useStreamingMessage` buffer; only `streaming=true` stays asserted across the gap.
-> 5. Flip the `test.fixme()` marker off in `chat-sse-reconnect.spec.ts` — it becomes the acceptance test for S11-2.
->
-> The corresponding row in the §4.7 failure-mode table above has been updated to point here and to clarify that the impl uses `fetch` + reader, not `EventSource`. **(Carry: refines DEC-LLD-CHAT-UI-003 — preserved-partial guarantee survives the reconnect.)**
+> **✅ Shipped in sprint-11 (xiaoguai PR #116, merged 2026-05-30, v1.8.1).** `XiaoguaiClient.sendMessage()` now wraps the streaming POST in an exponential-backoff retry loop (1 s → 2 s → 4 s → 8 s → 16 s, cap 30 s; `Idempotency-Key` header so server-side dedup makes the restart safe). The optional `onReconnect?(attempt)` callback drives `<SseReconnectBanner data-testid="sse-reconnect-banner">` in `ChatPage`. After 30 s without success, `onError` fires with `kind: "reconnect_failed"` and the manual retry button appears. The partial-bubble guarantee (DEC-LLD-CHAT-UI-003) survives the gap — the `useStreamingMessage` buffer is preserved across reconnect attempts. The `chat-sse-reconnect.spec.ts` placeholder is now an acceptance test asserting both the banner and the partial-bubble invariant. The §4.7 failure-mode table row above reflects shipping reality.
 
 ## 5. Error handling
 
