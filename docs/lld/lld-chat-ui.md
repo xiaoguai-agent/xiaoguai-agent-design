@@ -120,15 +120,15 @@ If the user closes the tab during a pending verdict, the request stays open unti
 
 #### 4.3.2 Suspend / resume wiring — sprint-12 status
 
-> **Sprint-12 status — drift to close (S11-3a.2).** As of v1.8.1 the chat-ui's `<HotlBanner>` clears its submitting state via a 5 s optimistic-clear timeout (see PR #119), because the backend never emits a `hotl_resolved` event — the loop does not suspend. Sprint-12 closes the loop end-to-end:
+> **✅ Shipped in sprint-12 (xiaoguai PRs #128, #131, #132).** The chat-ui's `<HotlBanner>` is now resume-driven: `hotl_resolved` is the primary clear signal, with the optimistic-clear timer extended to 30 s as a defensive fallback for SSE-interrupted cases. Sprint-12 closed the loop end-to-end:
 >
-> 1. Backend agent loop adopts `SuspendingHotlGate` (per-tenant config flag `agent.hotl.suspend_on_escalate`; default `false` in v1.8.x, `true` from v1.9). See [`lld-agent.md`](lld-agent.md) §4.5 + DEC-LLD-AGENT-004.
-> 2. Backend emits new SSE events `hotl_pending` (on Suspend verdict) and `hotl_resolved` (on operator verdict / timeout). See [`api-contract.md`](../api-contract.md) §2.6.3 for the wire shape.
-> 3. `frontend/shared/src/agentEventStream.ts` parses the two new event kinds and surfaces them via the `useStreamingMessage` reducer (unknown-event tolerance from §4.7 keeps older backends working — chat-ui just falls back to the sprint-11 optimistic-clear path).
-> 4. `<HotlBanner>` waits for `hotl_resolved` (matched by `request_id`) before clearing, **dropping the 5 s timeout**. If `hotl_resolved` arrives with `verdict: "timeout"`, the banner shows a "decision timed out — tool call denied" annotation. If the operator verdict from `POST /v1/hotl/decisions` and the `hotl_resolved` event disagree (e.g. network race + a sibling tab decided first), the SSE event wins and the local submitting state is reverted with a one-line conflict toast.
-> 5. New e2e `frontend/e2e/tests/chat-ui/chat-hotl-suspend-resume.spec.ts` cases: (a) approve → tool dispatches and result streams; (b) deny → tool is skipped, agent observes failed ToolResult and replies; (c) operator-via-admin-ui in a sibling tab → chat-ui's banner clears via the SSE event alone, no local POST.
+> 1. ✅ **Done** — Backend agent loop adopts `SuspendingHotlGate` (per-tenant config flag `agent.hotl.suspend_on_escalate`; default `false` in v1.8.x, `true` from v1.9). Shipped via PR #131 (S12-5+S12-9: ReAct loop Suspend arm + 4 backend integration tests covering happy path, timeout, cancel, and the legacy default-off regression). See [`lld-agent.md`](lld-agent.md) §4.5 + DEC-LLD-AGENT-004.
+> 2. ✅ **Done** — Backend emits new SSE events `hotl_pending` (on Suspend verdict) and `hotl_resolved` (on operator verdict / timeout). Wire shape per [`api-contract.md`](../api-contract.md) §2.6.3.
+> 3. ✅ **Done** — `frontend/shared/src/agentEventStream.ts` parses the two new event kinds (PR #128) and surfaces them via the `useStreamingMessage` reducer; unknown-event tolerance from §4.7 keeps older backends working — chat-ui falls back to the optimistic-clear path.
+> 4. ✅ **Done** — `<HotlBanner>` waits for `hotl_resolved` (matched by `request_id`) as the primary clear signal (PR #128). The optimistic-clear `setTimeout` is **retained as a defensive fallback** and extended from 5 s → 30 s so it doesn't fire before a healthy SSE round-trip. If `hotl_resolved` arrives with `verdict: "timeout"`, the banner shows the `chat.hotl.timeout_annotation` label for 3 s then clears. If the operator verdict from `POST /v1/hotl/decisions` and the eventual `hotl_resolved` disagree (e.g. network race + a sibling tab decided first), the SSE event wins and the local submitting state is reverted with a one-line `chat.hotl.conflict_toast`.
+> 5. ✅ **Done** — Three new e2e cases in `frontend/e2e/tests/chat-ui/chat-hotl-suspend-resume.spec.ts` (PR #132): (a) approve → tool dispatches and result streams; (b) deny → tool is skipped, agent observes failed ToolResult and replies; (c) operator-via-admin-ui in a sibling tab → chat-ui's banner clears via the SSE event alone, no local POST.
 >
-> The optimistic-clear path remains as a defensive fallback when the SSE stream is interrupted between `submitHotlDecision()` succeeding and `hotl_resolved` arriving — the existing reconnect banner (§4.7.1) covers the gap. **(Carry: refines DEC-LLD-CHAT-UI-002 + the new DEC-LLD-AGENT-004 — the inline panel becomes truly resume-driven, not optimistic.)**
+> The 30 s defensive fallback timer covers the gap when the SSE stream is interrupted between `submitHotlDecision()` succeeding and `hotl_resolved` arriving — the reconnect banner (§4.7.1) handles the parallel reconnect surface. **(Refines DEC-LLD-CHAT-UI-002 + the new DEC-LLD-AGENT-004 — the inline panel is now truly resume-driven, with the timer demoted to a defensive fallback.)**
 
 ### 4.4 Watch indicator (BEH-CHAT-001 sibling)
 
@@ -205,7 +205,7 @@ artifact:
   status: draft
   owners: [engineering.xiaoguai]
   created_at: 2026-05-29
-  updated_at: 2026-05-30
+  updated_at: 2026-05-31
   source_documents: [HLD-XIAOGUAI-001, PRD-XIAOGUAI-001, API-XIAOGUAI-001]
 entities:
   requirements: []
