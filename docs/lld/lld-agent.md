@@ -312,6 +312,80 @@ impl DecisionRegistry {
 
 **Test design**: see §7's "Integration" row — sprint-12 adds `hotl_suspend.rs` (suspend → resolve happy path), `hotl_suspend_timeout.rs` (no operator → timeout synthesises Deny), `hotl_suspend_cancel.rs` (user cancels mid-suspension → cancel wins over operator).
 
+### 4.6 HotL hardening (sprint-13)
+
+> **Status:** ✅ shipped in sprint-13 (xiaoguai PRs #139, #141, #144, #145, #146, #147, #148, #142, #143, #149). Section retained for the design rationale. Refines §4.5 in four directions: registry persistence (DEC-HLD-013), policy-driven args redaction (DEC-HLD-014), per-scope timeouts (DEC-HLD-015), and the `escalation_id` rename + parent-table split (DEC-HLD-016). The §4.5 in-iteration suspension model is unchanged; this section specifies what changes around it.
+
+**Identifier rename.** Everywhere in `xiaoguai-agent` and the cross-crate wire — `HotlGateVerdict::Suspend { request_id, ... }`, `AgentEvent::HotlPending { request_id, ... }`, `AgentEvent::HotlResolved { request_id, ... }`, `DecisionRegistry::register(request_id)`, `DecisionRegistry::resolve(request_id, ...)` — the field is renamed to `escalation_id`. The `#[serde(alias)]` shim is removed. SSE consumers that previously accepted both names now see only `escalation_id`. The new authoritative type is:
+
+```rust
+pub enum HotlGateVerdict {
+    Allow,
+    Deny(String),
+    Suspend {
+        escalation_id: Uuid,        // renamed from request_id (sprint-12)
+        scope: String,
+        ticket: HotlSuspensionTicket,
+    },
+}
+```
+
+**DecisionRegistry persistence.** The registry gains a storage dependency:
+
+```rust
+pub struct DecisionRegistry {
+    waiters: DashMap<Uuid, oneshot::Sender<HotlDecisionVerdict>>,
+    store: Arc<dyn HotlEscalationStore>,   // sprint-13: PG-backed in production
+}
+
+#[async_trait]
+pub trait HotlEscalationStore: Send + Sync {
+    /// Called when SuspendingHotlGate registers a new escalation.
+    /// Persists the parent hotl_escalations row + the child hotl_pending row.
+    async fn insert_pending(&self, parent: HotlEscalationRow, child: HotlPendingRow) -> Result<(), StorageError>;
+
+    /// Called by POST /v1/hotl/decisions before the in-process oneshot fires.
+    /// Atomic update of status + decided_by + decided_at.
+    async fn record_decision(&self, escalation_id: Uuid, verdict: HotlDecisionVerdict) -> Result<(), StorageError>;
+
+    /// Called by run_serve at boot: returns all pending+unexpired rows.
+    async fn list_pending_unexpired(&self, now: DateTime<Utc>) -> Result<Vec<HotlPendingRow>, StorageError>;
+}
+```
+
+`xiaoguai-core::run_serve` calls `list_pending_unexpired` immediately after `AppState` construction and before the HTTP server begins accepting requests. For each row it: (a) mints a fresh `oneshot::channel`; (b) inserts the sender into `waiters`; (c) spawns a `tokio::time::sleep_until(row.expires_at)` companion future bound to the same `escalation_id`. The replay path is logged at `info` level and the count is exported via `xiaoguai_hotl_registry_replayed_total{outcome}`.
+
+Live oneshot delivery latency is unchanged from §4.5 (DashMap O(1) lookup). The persistence dependency adds one PG write per `register` and one per `resolve`; both are inside the existing per-iteration transaction in §6 so they do not introduce a new transaction boundary.
+
+**Args redaction.** The `args_redacted` field on `AgentEvent::HotlPending` is computed by a new policy hook:
+
+```rust
+// Lives in xiaoguai-auth::redaction
+pub struct RedactionRules { /* opaque, loaded per-tenant per-request */ }
+
+impl RedactionRules {
+    pub fn from_storage(s: &Storage, tenant_id: TenantId) -> impl Future<Output = Result<Self, AuthError>>;
+    pub fn apply(&self, scope: &str, args: &serde_json::Value) -> serde_json::Value;  // replaces matched JSONPath nodes with "***"
+}
+```
+
+`SuspendingHotlGate` resolves the rules from `AppState` and calls `apply(scope, args)` before constructing the `HotlPending` event. Empty rules degrade to `args.clone()` and emit a single `tracing::warn!` per tenant per boot ("no HotL redaction policy configured — args emitted verbatim"). The audit row that pairs with the `HotlPending` carries the resolved `redaction_policy_id` so the audit chain can prove which policy version was applied.
+
+**Per-scope timeouts.** `SuspendingHotlGate::check` no longer reads a single `default_expiry`. The new lookup:
+
+```rust
+fn resolve_expiry(cfg: &HotlConfig, scope: &str) -> Duration {
+    let class = scope.split_once('.').map(|(c, _)| c).unwrap_or(scope);
+    cfg.expiry.get(class).copied().unwrap_or(cfg.default_expiry)
+}
+```
+
+The `default_expiry` field stays in `HotlConfig` as the documented fallback (DEC-HLD-015). Lookup is per-call, not cached — tenants editing their config at runtime are honoured on the next escalation.
+
+**Why parent/child schema matters for the loop.** The split into `hotl_escalations` (parent) + `hotl_pending` (child) does not change the loop's per-tool-call locality (one `Suspend` verdict → one ticket → one `resolve`). It only changes what `insert_pending` writes: an iteration that triggers multiple gates (e.g., DEC-021 triangle with per-peer HotL) writes one parent row plus N children sharing that `escalation_id` lineage. The loop code remains §4.5's single-`Suspend` arm; the registry's `register` call carries the parent id when one already exists for the iteration.
+
+**Test design** — see §7's "Integration" row: sprint-13 adds `hotl_persistence_replay.rs` (5 pending rows survive a simulated restart and resolve correctly), `hotl_args_redaction.rs` (password field masked before SSE emit), `hotl_per_scope_expiry.rs` (mcp.* scope picks 4h over default 24h), `hotl_escalation_id_rename.rs` (regression — old `request_id` payload rejected with 400), `hotl_decide_scope.rs` (operator without `hotl:decide` scope gets 403).
+
 ## 5. Error handling
 
 ```rust
@@ -337,7 +411,7 @@ pub enum AgentError {
 | Layer | Cases |
 |---|---|
 | Unit | `react.rs` state machine: one-shot reply, multi-tool reply, escalated reply, cancelled reply. `history.rs` slide: noop_when_under_window, drops_oldest_non_system, drops_dangling_tool_message_at_new_head, window_zero_is_unbounded. `history.rs` compact: compact_noop_when_under_keep_recent, compact_replaces_head_with_summary, compact_falls_back_to_slide_on_backend_error, compact_preserves_tool_pairing, should_compact_threshold. |
-| Integration | `hotl_escalate.rs` — exceeded budget yields synthetic result + audit row; `cancel.rs` — cancel mid-tool returns Final(cancelled) within slowest-tool-deadline. **`compaction_integration.rs`** (v0.5.4.1): `compaction_shrinks_large_history_via_summary` — 100-turn synthetic conversation with 30 tool-call cycles compacts to ≤ 50 % of `max_context_tokens`; `compaction_preserves_recent_turns_verbatim` — last 6 messages bit-identical post-compaction. **Sprint-12 (S11-3a.2)**: `hotl_suspend.rs` — gate returns Suspend → loop emits HotlPending → registry.resolve(Allow) → loop emits HotlResolved + dispatches tool; `hotl_suspend_timeout.rs` — ticket times out → HotlResolved(Timeout) + synthetic Deny ToolResult; `hotl_suspend_cancel.rs` — cancellation registry fires during ticket.await → Final(Cancelled), no HotlResolved emitted. |
+| Integration | `hotl_escalate.rs` — exceeded budget yields synthetic result + audit row; `cancel.rs` — cancel mid-tool returns Final(cancelled) within slowest-tool-deadline. **`compaction_integration.rs`** (v0.5.4.1): `compaction_shrinks_large_history_via_summary` — 100-turn synthetic conversation with 30 tool-call cycles compacts to ≤ 50 % of `max_context_tokens`; `compaction_preserves_recent_turns_verbatim` — last 6 messages bit-identical post-compaction. **Sprint-12 (S11-3a.2)**: `hotl_suspend.rs` — gate returns Suspend → loop emits HotlPending → registry.resolve(Allow) → loop emits HotlResolved + dispatches tool; `hotl_suspend_timeout.rs` — ticket times out → HotlResolved(Timeout) + synthetic Deny ToolResult; `hotl_suspend_cancel.rs` — cancellation registry fires during ticket.await → Final(Cancelled), no HotlResolved emitted. **Sprint-13 (HotL hardening)**: `hotl_persistence_replay.rs` — 5 pending rows with mixed expiry survive an `AppState` rebuild; all 5 oneshot waiters reattach and a subsequent `POST /v1/hotl/decisions` resolves each; expired-on-replay rows synthesise verdict=timeout exactly once. `hotl_args_redaction.rs` — tool call with `{password: "x"}` arg under a tenant policy matching `$.password` emits `HotlPending.args_redacted = {password: "***"}`; audit row carries non-null `redaction_policy_id`. `hotl_per_scope_expiry.rs` — config sets `expiry.mcp = 4h`, default 24h; an `mcp.oauth.consent` escalation's `expires_at` is now+4h; a `tool_call.execute_python` escalation's `expires_at` is now+24h. `hotl_escalation_id_rename.rs` — `POST /v1/hotl/decisions` with body using legacy `request_id` field returns 400 with `field: escalation_id` discriminator error. `hotl_decide_scope.rs` — operator JWT without `hotl:decide` scope receives 403 on `POST /v1/hotl/decisions`. |
 | System | Test strategy L2: SSE event sequence shape; BEH-CHAT-001. Compaction metrics: `xiaoguai_compaction_triggered_total` increments per trigger; `xiaoguai_compaction_fallback_total / triggered` < 5 % in healthy deployments. |
 
 ## 8. Traceability metadata
@@ -352,7 +426,7 @@ artifact:
   status: draft
   owners: [engineering.xiaoguai]
   created_at: 2026-05-28
-  updated_at: 2026-05-28
+  updated_at: 2026-05-31
   source_documents: [HLD-XIAOGUAI-001, API-XIAOGUAI-001]
 entities:
   requirements: []
@@ -364,15 +438,22 @@ entities:
     - { id: DEC-LLD-AGENT-002, title: "Cancel polled at boundaries", statement: "Cancellation polled at iteration and tool-call boundaries.", status: approved, scope: in, decision: "Coarse-grained cancel.", rationale: "Avoids mid-LLM-stream tear-down complexity." }
     - { id: DEC-LLD-AGENT-003, title: "Compaction deferred to Tier-2d", statement: "History compaction not implemented in v1.4.", status: approved, scope: in, decision: "Truncate-only for now.", rationale: "Compaction policy design is open (PRD Q5)." }
     - { id: DEC-LLD-AGENT-004, title: "HotL suspension is in-iteration, not a new state machine", statement: "On HotlGateVerdict::Suspend the loop blocks within the existing iteration on a HotlSuspensionTicket (oneshot receiver + timeout) before dispatching tools, rather than lifting suspension to an outer state machine.", status: approved, scope: in, decision: "In-iteration await.", rationale: "Sessions are already serialised (one loop per session, §6); a separate state machine would re-derive the per-tool-call locality the loop already owns. Cancellation registry already covers the ‘operator never decides + user closes tab’ case via a select between ticket.await and cancel.observe()." }
+    - { id: DEC-LLD-AGENT-005, title: "HotL hardening — persistence + redaction + per-scope expiry + escalation_id rename", statement: "DecisionRegistry depends on HotlEscalationStore for boot-time replay; SuspendingHotlGate resolves RedactionRules from xiaoguai-auth before emitting HotlPending; expiry lookup is per-scope-class with default fallback; all wire fields rename request_id→escalation_id (no alias).", status: approved, scope: in, decision: "PG-backed registry + policy-driven redaction in xiaoguai-auth + per-scope expiry config + clean rename.", rationale: "Sprint-12 MVP loses live waiters on restart, leaks raw args to operators, uses one timeout for fundamentally different scope cadences, and carries a two-name surface for one identifier. Sprint-13 closes all four in one cohesive hardening pass." }
   flows:
     - { id: FLOW-LLD-AGENT-001, title: "ReAct iteration with HotL", statement: "Stream LLM, gate tool calls, parallel dispatch, append history, loop or finalise.", status: approved, scope: in, kind: module_interaction }
     - { id: FLOW-LLD-AGENT-002, title: "Cancellation propagation", statement: "Registry poll at boundaries; bounded by slowest tool.", status: approved, scope: in, kind: state_transition }
     - { id: FLOW-LLD-AGENT-003, title: "HotL suspend/resume (sprint-12)", statement: "On Suspend verdict emit HotlPending, await DecisionRegistry ticket (or timeout), emit HotlResolved, then dispatch or synthesise failed ToolResult based on operator verdict.", status: approved, scope: in, kind: module_interaction }
+    - { id: FLOW-LLD-AGENT-004, title: "HotL registry boot replay (sprint-13)", statement: "On AppState build, HotlEscalationStore.list_pending_unexpired drives per-row oneshot mint + sleep_until re-arm; HTTP server starts after replay completes.", status: approved, scope: in, kind: state_transition }
   test_cases: []
 relations:
   - { id: REL-LLD-AGENT-001, type: refines, from: DEC-LLD-AGENT-001, to: DEC-HLD-006, status: active }
   - { id: REL-LLD-AGENT-002, type: refines, from: FLOW-LLD-AGENT-001, to: FLOW-CHAT-001, status: active }
   - { id: REL-LLD-AGENT-003, type: refines, from: FLOW-LLD-AGENT-002, to: FLOW-CANCEL-001, status: active }
+  - { id: REL-LLD-AGENT-004, type: refines, from: DEC-LLD-AGENT-005, to: DEC-HLD-013, status: active }
+  - { id: REL-LLD-AGENT-005, type: refines, from: DEC-LLD-AGENT-005, to: DEC-HLD-014, status: active }
+  - { id: REL-LLD-AGENT-006, type: refines, from: DEC-LLD-AGENT-005, to: DEC-HLD-015, status: active }
+  - { id: REL-LLD-AGENT-007, type: refines, from: DEC-LLD-AGENT-005, to: DEC-HLD-016, status: active }
+  - { id: REL-LLD-AGENT-008, type: refines, from: FLOW-LLD-AGENT-004, to: DEC-HLD-013, status: active }
 waivers: []
 ```
 <!-- TRACEABILITY-METADATA:END -->

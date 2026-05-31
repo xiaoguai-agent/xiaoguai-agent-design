@@ -7,7 +7,7 @@
 | Status | `draft` |
 | Author | Zhou Wei |
 | Source | [`PRD-XIAOGUAI-001`](prd-xiaoguai.md), implementation repo `crates/xiaoguai-api/src/routes/` and `crates/xiaoguai-mcp/` |
-| Updated | 2026-05-28 |
+| Updated | 2026-05-31 |
 
 This contract is the **single source of truth** for the HTTP, SSE, and MCP surfaces. HLD and LLD reference identifiers from this document; they do not redefine endpoints.
 
@@ -243,13 +243,15 @@ Each job has at most one trigger plus one or more push sinks.
 
 #### 2.6.2 Decision shape (`POST /v1/hotl/decisions`)
 
-Operator verdicts on escalated tool calls. Sprint-11 (S11-3a.1) ships the **record-only** path; sprint-12 (S11-3a.2) flips the `resumed` field to dynamic when a suspended agent loop is waiting.
+Operator verdicts on escalated tool calls. Sprint-11 (S11-3a.1) shipped the **record-only** path; sprint-12 (S11-3a.2) flipped the `resumed` field to dynamic when a suspended agent loop is waiting. Sprint-13 (DEC-HLD-016) finishes the contract cleanup: the canonical identifier is `escalation_id` end-to-end, authorisation is the dedicated Casbin scope `hotl:decide`, and `escalation_id` references the `hotl_escalations` parent row introduced by migration 0027.
+
+> **Shipped:** xiaoguai PR #146 (backend `escalation_id` rename end-to-end), PR #147 (chat-ui rename), PR #143 (Casbin `hotl:decide` scope + DB-backed policy merge), PR #138 (migration 0027 — `hotl_escalations` parent + `redaction_policies` + Casbin row).
 
 Request:
 
 ```json
 {
-  "request_id": "uuid",          // also accepted as "escalation_id" (deprecated alias, sprint-13 removal)
+  "escalation_id": "uuid",       // canonical (sprint-13). The legacy `request_id` field is no longer accepted; requests using it return 400.
   "verdict": "allow",            // "allow" | "deny"
   "decided_by": "ops@acme.com",  // sprint-12: ignored when Claims carries a subject
   "raise_policy": {              // optional — "Approve & remember" UX
@@ -267,13 +269,15 @@ Response (`201 Created`):
 ```json
 {
   "id": "uuid",                  // decision row id
-  "request_id": "uuid",
+  "escalation_id": "uuid",       // matches the request; FK to hotl_escalations(id)
   "verdict": "allow",
   "recorded_at": "2026-05-30T08:12:34Z",
   "resumed": false,              // sprint-11: always false (no waiter exists, loop never suspended).
                                  // sprint-12 (S11-3a.2): true when DecisionRegistry resolved a live oneshot
                                  // waiter; false when the decision arrived after the loop already timed out
                                  // or the agent was never suspended (e.g. policy returned Allow client-side).
+                                 // sprint-13: also true when DecisionRegistry resolved a waiter that was
+                                 // *replayed* on API boot (DEC-HLD-013) — the registry layer is opaque to the route.
   "policy_created": {            // present iff raise_policy was supplied AND policy was created in-tx
     "id": "uuid",
     "scope": "tool_call.execute_python",
@@ -288,42 +292,47 @@ Status codes:
 | Code | When |
 |---|---|
 | `201 Created` | Decision recorded (`resumed` may be `true` or `false`). |
+| `400 Bad Request` | Body uses legacy `request_id` field (sprint-13 rename; see DEC-HLD-016); or `escalation_id` malformed. Response carries `{"error":"field","field":"escalation_id","message":"..."}`. |
 | `401 Unauthorized` | Bearer missing or invalid. |
-| `403 Forbidden` | Missing `hotl:decide` scope (sprint-11 uses a path-based fallback; sprint-12 onwards uses the dedicated Casbin rule). |
-| `404 Not Found` | Unknown `request_id` (S11-3a.1 has no parent `hotl_escalations` table; sprint-12 adds it and tightens this check). |
-| `409 Conflict` | Duplicate decision for the same `request_id`. Operators must inspect the existing record. |
-| `503 Service Unavailable` | `HotlDecisionStore` not wired in production `AppState` (default until S11-3a.2's PG impl + DecisionRegistry land). |
+| `403 Forbidden` | Caller's Casbin scopes do not include `hotl:decide` (sprint-13: the sprint-11 path-based fallback `p, *, /v1/hotl/decisions, POST` is removed by migration 0027). Granted by the `tenant_admin` and `operator` roles. |
+| `404 Not Found` | Unknown `escalation_id` — no row in `hotl_escalations` for this tenant. Sprint-12 added the parent table; sprint-13's migration 0027 makes it the authoritative parent for `hotl_pending` children, so 404 now means the parent does not exist (not merely that no pending row matches). |
+| `409 Conflict` | Duplicate decision for the same `escalation_id`. Operators must inspect the existing record. |
+| `503 Service Unavailable` | `HotlEscalationStore` not wired in production `AppState` (should not occur post-sprint-13; DEC-HLD-013 makes the PG impl the default). |
 
 #### 2.6.3 SSE events — `hotl_pending` and `hotl_resolved`
 
-Two SSE event variants on the chat message stream (`POST /v1/sessions/{id}/messages`, `Accept: text/event-stream`). Both are sprint-12 additions; sprint-11 has neither (the agent loop does not suspend — see [`lld-agent.md`](lld/lld-agent.md) §4.5).
+Two SSE event variants on the chat message stream (`POST /v1/sessions/{id}/messages`, `Accept: text/event-stream`). Both are sprint-12 additions; sprint-11 has neither (the agent loop does not suspend — see [`lld-agent.md`](lld/lld-agent.md) §4.5). Sprint-13 renames the identifier field from `request_id` to `escalation_id` end-to-end (DEC-HLD-016) — the alias is removed.
+
+> **Shipped:** xiaoguai PR #146 (`AgentEvent::HotlPending` / `HotlResolved` rename + SSE field rename), PR #147 (chat-ui `HotlBanner` state keyed by `escalation_id`).
 
 `hotl_pending` — emitted by `xiaoguai-agent` when `HotlGate::check` returns `Suspend`:
 
 ```json
 {
   "type": "hotl_pending",
-  "request_id": "uuid",
+  "escalation_id": "uuid",
   "tool": "execute_python",
-  "args_redacted": { "...": "policy-driven redaction" },
+  "args_redacted": { "password": "***" },    // policy-driven; per-tenant hotl_redaction_policies (DEC-HLD-014)
   "scope": "tool_call.execute_python",
-  "expires_at": "2026-05-31T08:12:34Z"   // server-side timeout (24h default), same clock as decisions.recorded_at
+  "expires_at": "2026-05-31T08:12:34Z"       // per-scope-class timeout (DEC-HLD-015); same clock as decisions.recorded_at
 }
 ```
+
+`args_redacted` is computed by `xiaoguai-auth::redaction::RedactionRules::apply(scope, args)`; matching JSONPath selectors are replaced with `"***"`. The field is always present; an empty redaction policy degrades to args verbatim and a boot warning. `expires_at` uses the per-scope class lookup (`tool` / `mcp` / `skill`) with the global `default_expiry` as fallback.
 
 `hotl_resolved` — emitted by `xiaoguai-agent` after `DecisionRegistry` resolves the waiter (verdict from `POST /v1/hotl/decisions`) OR after the server-side timeout fires:
 
 ```json
 {
   "type": "hotl_resolved",
-  "request_id": "uuid",
+  "escalation_id": "uuid",
   "verdict": "allow",            // "allow" | "deny" | "timeout"
   "decided_by": "ops@acme.com",  // omitted when verdict = "timeout"
   "recorded_at": "2026-05-30T08:13:01Z"
 }
 ```
 
-Frontend contract (cross-ref [`lld-chat-ui.md`](lld/lld-chat-ui.md) §4.3): on `hotl_pending`, render `<HotlBanner>` in the pending state. On `hotl_resolved`, clear the banner. Sprint-11's chat-ui has neither hook wired — it relies on an optimistic-clear timeout after a successful `POST /v1/hotl/decisions`; sprint-12 (S11-3a.2) removes that timeout and waits for `hotl_resolved` exclusively.
+Frontend contract (cross-ref [`lld-chat-ui.md`](lld/lld-chat-ui.md) §4.3): on `hotl_pending`, render `<HotlBanner>` in the pending state, keyed by `escalation_id`. On `hotl_resolved`, clear the banner. Sprint-11's chat-ui has neither hook wired — it relies on an optimistic-clear timeout after a successful `POST /v1/hotl/decisions`; sprint-12 (S11-3a.2) removes that timeout and waits for `hotl_resolved` exclusively. Sprint-13 chat-ui must also update its banner state key from `request_id` to `escalation_id` in lockstep — there is no compat path.
 
 ### 2.7 Skill packs
 
@@ -634,7 +643,7 @@ artifact:
   status: draft
   owners: [engineering.xiaoguai]
   created_at: 2026-05-28
-  updated_at: 2026-05-28
+  updated_at: 2026-05-31
   source_documents:
     - PRD-XIAOGUAI-001
 entities:

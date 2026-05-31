@@ -6,7 +6,7 @@
 | Type | Project guardrails |
 | Status | `draft` |
 | Source | `PRD-XIAOGUAI-001`, `HLD-XIAOGUAI-001`, implementation repo CI configs and `deny.toml` |
-| Updated | 2026-05-28 |
+| Updated | 2026-05-31 |
 | Review cadence | Quarterly, plus event-driven on the triggers in §10 |
 
 Guardrails are **project-level engineering rules** that downstream documents (LLD, runbook, code) MUST follow. They are not per-feature requirements; they are invariants enforced by CI or by operational policy.
@@ -56,6 +56,27 @@ Guardrails are **project-level engineering rules** that downstream documents (LL
 | GR-SEC-10 | `cargo audit` (advisory DB) MUST be clean on every PR; ignored advisories are documented in `deny.toml` with an expiry. | `audit.yml` workflow |
 | GR-SEC-11 | `cargo vet` trust list reviewed quarterly; new crate dependencies require a vet entry. | `cargo-vet.yml` workflow |
 | GR-SEC-12 | OWASP A01–A10 self-check applied to every new HTTP route at code-review time. | `security-review` skill or PR template checkbox |
+| GR-SEC-13 | HotL `args_redacted` MUST be computed by `xiaoguai-auth::redaction::RedactionRules::apply` before any SSE emission or audit row write. Direct copies of raw tool-call args into `AgentEvent::HotlPending` are forbidden. (DEC-HLD-014) | PR #148 + test in `crates/xiaoguai-core/tests/hotl_args_redaction.rs` |
+| GR-SEC-14 | `POST /v1/hotl/decisions` MUST be guarded by the Casbin scope `hotl:decide`. Path-based fallback rules for this route are forbidden. (DEC-HLD-016) | PR #143 + test in `crates/xiaoguai-api/tests/hotl_decide_scope.rs` |
+
+### 3.1 Redaction policy (HotL operator-visibility surface)
+
+The HotL operator-visibility surface — the chat-ui banner that displays a pending tool call to the human reviewer — is downstream of every other redaction backstop (audit chain redaction per DEC-HLD-004, OTel span redaction per GR-SEC-05). Without a dedicated rule layer there, a raw `password` or `account_number` argument shown in a banner becomes the leak point.
+
+DEC-HLD-014 introduces per-tenant redaction policies in table `hotl_redaction_policies`:
+
+| Column | Type | Notes |
+|---|---|---|
+| `tenant_id` | uuid | RLS-scoped per GR-SEC-03 |
+| `scope` | text | Tool-call scope this rule fires for (e.g. `tool_call.execute_python`); `*` matches all |
+| `jsonpath` | text | JSONPath-style selector against the tool-call argument JSON; matched nodes are replaced with `"***"` |
+| `applies_to` | text[] | `["sse"]`, `["audit"]`, or both. `["sse"]` is the minimum-allowed configuration |
+
+Policy evaluation lives in `xiaoguai-auth::redaction` alongside Casbin (see DEC-HLD-014 rationale for crate choice). The rule layer is mandatory on the emission path: `SuspendingHotlGate` cannot bypass `RedactionRules::apply` — there is no operator opt-out. An empty rule set degrades to "args verbatim + boot warning" so tenants are not silently exposed.
+
+Operators MUST configure at least one `applies_to=["sse"]` policy per tenant before flipping `agent.hotl.suspend_on_escalate = true`. The boot-time warning is GR-SEC-13's failure surface; the runbook references this paragraph.
+
+> **Shipped:** xiaoguai PR #144 (`xiaoguai-auth::redaction::RedactionRules` + `HotlRedactionRepo` wiring), PR #148 (`SuspendingHotlGate` applies `RedactionRules` before SSE/audit emission), PR #138 (migration 0027 introduces `redaction_policies` table).
 
 ---
 
@@ -202,7 +223,7 @@ artifact:
   status: draft
   owners: [engineering.xiaoguai, security.xiaoguai]
   created_at: 2026-05-28
-  updated_at: 2026-05-28
+  updated_at: 2026-05-31
   source_documents:
     - PRD-XIAOGUAI-001
     - HLD-XIAOGUAI-001
