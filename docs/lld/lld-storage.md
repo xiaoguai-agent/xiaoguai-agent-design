@@ -37,6 +37,8 @@ impl Storage {
     pub fn messages(&self) -> MessageRepo<'_>;
     pub fn memories(&self) -> MemoryRepo<'_>;
     pub fn hotl(&self) -> HotlPolicyRepo<'_>;
+    pub fn hotl_escalations(&self) -> HotlEscalationRepo<'_>;   // sprint-13 (DEC-HLD-013, DEC-HLD-016)
+    pub fn hotl_redaction(&self) -> HotlRedactionRepo<'_>;      // sprint-13 (DEC-HLD-014)
     pub fn audit(&self) -> AuditWriter<'_>;
     pub fn llm_providers(&self) -> ProviderRepo<'_>;
     pub fn token_usage(&self) -> TokenUsageRepo<'_>;
@@ -64,6 +66,8 @@ crates/xiaoguai-storage/
 │   │   ├── messages.rs
 │   │   ├── memories.rs      # pgvector recall queries
 │   │   ├── hotl.rs
+│   │   ├── hotl_escalations.rs   # sprint-13 — parent+child + boot replay query
+│   │   ├── hotl_redaction.rs     # sprint-13 — per-tenant JSONPath rules
 │   │   ├── llm_providers.rs
 │   │   ├── token_usage.rs
 │   │   ├── mcp_servers.rs
@@ -76,8 +80,13 @@ crates/xiaoguai-storage/
 │   └── audit_writer.rs      # consumed by xiaoguai-audit
 ├── migrations/
 │   ├── 0001_init.sql
-│   ├── … (20 total)
-│   └── 0020_seed_ollama_default.sql
+│   ├── … (20 total through v1.4)
+│   ├── 0020_seed_ollama_default.sql
+│   ├── 0026_hotl_pending.sql           # sprint-11
+│   └── 0027_hotl_escalations_split.sql # sprint-13 (DEC-HLD-016): hotl_escalations parent,
+│                                       # hotl_pending child FK, hotl_redaction_policies,
+│                                       # casbin hotl:decide rule + path-based-rule removal,
+│                                       # backfill existing hotl_pending rows 1-to-1 into parents
 └── tests/
     ├── rls_isolation.rs     # adversarial cross-tenant tests
     └── recall_hnsw.rs       # pgvector index correctness
@@ -117,6 +126,25 @@ LIMIT $4;
 ### 4.3 Migration apply at boot
 
 `sqlx::migrate!()` runs at boot before any handler is mounted; if a migration fails the process exits non-zero.
+
+### 4.4 HotL escalation boot replay (sprint-13)
+
+`HotlEscalationRepo::list_pending_unexpired(now)` returns every `hotl_pending` row whose parent has `status='pending'` and `expires_at > now`, RLS-scoped by tenant via the same `with_tenant` mechanism (DEC-HLD-008 holds — escalations are tenant rows). Query is a plain indexed scan on `(status, expires_at)`; expected cardinality is small (< 1k rows in a healthy tenant).
+
+```sql
+SELECT p.escalation_id, p.tenant_id, p.scope, p.tool, p.args_redacted, p.expires_at
+FROM hotl_pending p
+JOIN hotl_escalations e ON e.id = p.escalation_id
+WHERE e.tenant_id = $1
+  AND e.status = 'pending'
+  AND p.expires_at > now();
+```
+
+The query is invoked once per tenant during `xiaoguai-core::run_serve` startup, before the HTTP listener binds. Per-row failures (e.g. expired between query and re-arm) degrade to `verdict=timeout` synthesis exactly as if the row had expired in steady state — there is no special "replay timeout" verdict.
+
+### 4.5 HotL redaction policy load (sprint-13)
+
+`HotlRedactionRepo::load_for_tenant(tenant_id) -> RedactionRules` is called by `xiaoguai-auth::redaction::RedactionRules::from_storage` on every request that may emit a `HotlPending` event. The repo joins the `hotl_redaction_policies` table by `tenant_id` + matching `scope`; a tenant-level cache (1-minute TTL, invalidated on `UPDATE`/`INSERT`/`DELETE`) avoids per-emission round-trips.
 
 ## 5. Error handling
 
@@ -159,7 +187,7 @@ artifact:
   status: draft
   owners: [engineering.xiaoguai]
   created_at: 2026-05-28
-  updated_at: 2026-05-28
+  updated_at: 2026-05-31
   source_documents: [HLD-XIAOGUAI-001, API-XIAOGUAI-001, GUARDRAILS-XIAOGUAI-001]
 entities:
   requirements: []
@@ -169,13 +197,17 @@ entities:
   decisions:
     - { id: DEC-LLD-STO-001, title: "Single PgPool per Storage", statement: "One sqlx PgPool owned by Storage; cloning is cheap (Arc).", status: approved, scope: in, decision: "Single pool.", rationale: "Avoid pool fragmentation across crates." }
     - { id: DEC-LLD-STO-002, title: "Tenant-scoped transactions via SET LOCAL", statement: "with_tenant sets SET LOCAL app.current_tenant_id; repositories also WHERE tenant_id=$1.", status: approved, scope: in, decision: "Double-layer.", rationale: "Defence in depth (GR-SEC-03)." }
+    - { id: DEC-LLD-STO-003, title: "hotl_escalations parent + hotl_pending child schema (migration 0027)", statement: "hotl_escalations holds one row per top-level invocation; hotl_pending references it via escalation_id FK. Backfill is 1-to-1 against existing rows.", status: approved, scope: in, decision: "Parent/child split via forward-only migration.", rationale: "Nested gating (DEC-HLD-021 triangle + per-peer HotL) needs a parent dimension that the single-table schema does not express." }
   flows:
     - { id: FLOW-LLD-STO-001, title: "Tenant-scoped read", statement: "with_tenant sets SET LOCAL then runs query.", status: approved, scope: in, kind: module_interaction }
     - { id: FLOW-LLD-STO-002, title: "Memory recall via pgvector HNSW", statement: "ORDER BY (1 - cosine_distance) DESC LIMIT k.", status: approved, scope: in, kind: module_interaction }
+    - { id: FLOW-LLD-STO-003, title: "HotL boot replay query (sprint-13)", statement: "list_pending_unexpired joins hotl_pending → hotl_escalations RLS-scoped, returns rows for run_serve to re-mint oneshot waiters.", status: approved, scope: in, kind: module_interaction }
   test_cases: []
 relations:
   - { id: REL-LLD-STO-001, type: refines, from: DEC-LLD-STO-002, to: DEC-HLD-008, status: active }
   - { id: REL-LLD-STO-002, type: refines, from: FLOW-LLD-STO-002, to: REQ-MEM-001, status: active }
+  - { id: REL-LLD-STO-003, type: refines, from: DEC-LLD-STO-003, to: DEC-HLD-016, status: active }
+  - { id: REL-LLD-STO-004, type: refines, from: FLOW-LLD-STO-003, to: DEC-HLD-013, status: active }
 waivers: []
 ```
 <!-- TRACEABILITY-METADATA:END -->

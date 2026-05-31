@@ -7,7 +7,7 @@
 | Status | `draft` |
 | Author | Zhou Wei |
 | Source | [`PRD-XIAOGUAI-001`](prd-xiaoguai.md), [`API-XIAOGUAI-001`](api-contract.md), implementation repo |
-| Updated | 2026-05-28 |
+| Updated | 2026-05-31 |
 
 > **Retrofit notice.** This HLD describes the architecture as it exists at v1.4.0. ADR identifiers (`ADR-0001`…`ADR-0018`) refer to records in the implementation repo `docs/architecture/adr/`.
 
@@ -412,6 +412,66 @@ Five sub-decisions that follow from the dual-SPA split:
 
 **Adds:** `lld/lld-admin-ui.md`, `lld/lld-chat-ui.md`, sprint-10b task line in roadmap §4, PRD §4.14 UI requirements, test-spec §3.14 UI golden-path cases.
 
+### DEC-026 — DecisionRegistry is PG-backed; in-process waiters replay on boot (sprint-13)
+
+**Statement:** The `DecisionRegistry` introduced in sprint-12 (DEC-006 follow-up, see [`lld-agent.md`](lld/lld-agent.md) §4.5) graduates from an in-memory `DashMap<Uuid, oneshot::Sender<_>>` to a durable layer backed by the `hotl_pending` table (extended in DEC-029). Verdicts continue to flow through the in-process oneshot when a waiter exists; the new property is that **pending escalations survive `xiaoguai-api` restarts**. On boot, `xiaoguai-core::run_serve` scans `hotl_pending WHERE status='pending' AND expires_at > now()`, re-mints in-process `HotlSuspensionTicket` senders for each row, and re-arms the per-row `tokio::time::sleep_until(expires_at)` timeout future. The in-process registry stays the source of truth for **live oneshot delivery**; Postgres is the source of truth for **which escalations exist** and their lifecycle state. The chat session itself does not need to be resumed — sessions are stateless across requests; on the next `POST /v1/sessions/{id}/messages` the loop reads back its history (which already includes the prior `hotl_pending` event) and the operator decision arrives via the replayed waiter exactly as if the API had never restarted.
+
+**Rationale:** The sprint-12 MVP loses every live waiter on `xiaoguai-api` restart, which forces the next scheduler tick to synthesise `verdict=timeout` even when the operator approved seconds earlier. For production tenants that already trust HotL for cost-bounded autonomy, that failure mode is unacceptable — restarts (rolling deploys, k8s pod recycling, OS patching) happen routinely. Choosing **PG row + in-process waiter** over **Redis pub/sub + ephemeral waiter** keeps the single-binary air-gap deployment (DEC-002) intact and reuses RLS for tenant isolation; the Valkey/Redis backend stays opt-in for cache, not required for HotL. Sub-second oneshot delivery preserves operator UX; the durable layer is only consulted on boot and at decision-write time.
+
+**Refines:** DEC-006 (HotL allow-then-escalate — adds restart durability), DEC-008 (RLS double-layer — extends to escalations), R.E.S.T Reliability dominant + Traceability (durable lifecycle audit trail).
+
+**Metrics:** `xiaoguai_hotl_registry_replayed_total{outcome}` (on boot: how many pending rows reattached, expired-on-replay, or were marked dropped), `xiaoguai_hotl_registry_size_gauge` (live waiter count), `xiaoguai_hotl_decision_replay_latency_seconds` histogram.
+
+### DEC-027 — HotL args redaction is policy-driven, applied before SSE emission (sprint-13)
+
+**Statement:** `HotlPending.args_redacted` stops being a pass-through of the raw tool-call arguments. A new per-tenant **redaction policy** declares JSONPath-style field selectors whose values are masked to the fixed sentinel `"***"` before the gate emits `AgentEvent::HotlPending`. Policy lives in a new table `hotl_redaction_policies (tenant_id, scope, jsonpath, applies_to)` with RLS, and is loaded into `xiaoguai-auth::redaction::RedactionRules` at request time. The policy DSL ships in **`xiaoguai-auth`** (not a new crate) because the same crate already owns Casbin policy parsing — colocating the two policy languages keeps the operator surface coherent and avoids a third crate dependency edge for `xiaoguai-agent` and `xiaoguai-api` (both already depend on `xiaoguai-auth`). Selectors are matched against the tool-call argument JSON tree; matches are replaced in-place. Redaction is mandatory on the emission path — there is no opt-out flag — and an empty policy degrades to "emit args verbatim" with a boot warning so tenants notice they have no rules configured.
+
+**Rationale:** A passwords-in-clear example tool call shown to a tenant operator in the chat-ui banner is an exfiltration vector that defeats DEC-004's PII redaction (audit) and DEC-009's telemetry redaction (logs) — both backstops sit downstream of the operator's eyes. Driving redaction from policy rather than hard-coded patterns lets each tenant declare what counts as sensitive in their domain (a fintech tenant masks `account_number`; a healthcare tenant masks `mrn`). Reusing `xiaoguai-auth` over creating a new `xiaoguai-redaction` crate avoids cross-crate plumbing for a feature that is fundamentally policy evaluation — the same logic that gates `who can decide` should gate `what they see when they decide`.
+
+**Deferred decision:** the alternative "spawn `xiaoguai-redaction` as a sibling crate of `xiaoguai-auth`" was considered. Rejected for sprint-13; reconsider only if the policy language grows past Casbin's expressive frame (e.g., regex selectors plus tree rewrites). Documented here so the next reviewer does not relitigate.
+
+**Refines:** DEC-006 (HotL — completes the operator-visibility surface), DEC-004 (audit redaction — same redact-before-emit philosophy), R.E.S.T Security dominant.
+
+**Audit:** Every `HotlPending` audit row carries a `redaction_policy_id` foreign key so post-hoc compliance can prove which policy was applied at decision time, even if the policy is later updated.
+
+### DEC-028 — HotL timeouts are per-scope; global `default_expiry` is the fallback (sprint-13)
+
+**Statement:** The single `agent.hotl.default_expiry` Duration is split into a per-scope namespace under `agent.hotl.expiry.<scope_class>` in `config.yaml` (and the corresponding `XIAOGUAI_AGENT__HOTL__EXPIRY__<SCOPE>` env vars):
+
+```yaml
+agent:
+  hotl:
+    default_expiry: 24h        # fallback when no per-scope key matches
+    expiry:
+      tool: 24h                # tool_call.* scopes
+      mcp: 4h                  # mcp.* scopes (network egress; tighter)
+      skill: 72h               # skill_author scope (admin approval; longer)
+```
+
+Lookup order at `HotlEnforcer::escalate(scope, ...)`: split `scope` on `.`, take the first component, look up `expiry.<first_component>`; on miss, fall back to `default_expiry`. The fallback path is the only backward-compat surface — tenants who have not set per-scope keys keep the v1.9.x behaviour byte-identically.
+
+**Rationale:** Different scopes have fundamentally different operator response cadences. A `tool_call.execute_python` escalation is acute (operator wants to decide within minutes); a `skill_author.propose_skill` (DEC-014) is asynchronous (operator may batch-approve overnight); an `mcp.oauth.consent` (DEC-015) is even slower (waiting on a human to click consent in another tab). Forcing all three onto the same 24h window either denies-by-timeout on the slow ones or makes the fast ones loiter in the queue. Per-scope timeouts are also a precondition for tightening the `mcp.*` window to hours, which limits the blast radius of a stuck network-egress escalation.
+
+**Refines:** DEC-006 (HotL — operationalises the timeout dimension), DEC-026 (registry persistence — sleep_until is now per-row not per-class), R.E.S.T Reliability.
+
+**Metrics:** `xiaoguai_hotl_timeout_total{scope_class}` (broken out so saturation in one class does not mask in another), `xiaoguai_hotl_pending_age_seconds{scope_class}` histogram.
+
+### DEC-029 — `escalation_id` is the canonical identifier; `hotl_escalations` parent table splits the schema (sprint-13)
+
+**Statement:** Three coupled cleanups land as one decision because they share the same migration:
+
+1. **Naming.** The SSE contract, decision endpoint, and persistence layer all use **`escalation_id`** as the canonical identifier. The sprint-12 `#[serde(alias = "escalation_id")]` shim on `request_id` is removed. Frontend (`chat-ui` HotlBanner), backend (`AgentEvent::HotlPending`, `DecisionRegistry`, `POST /v1/hotl/decisions`), audit rows, and metrics labels all rename in lockstep. Old clients sending `request_id` get `400 Bad Request` with a discriminator-error pointing at the field name — there is no transparent compatibility path.
+
+2. **Casbin scope.** `POST /v1/hotl/decisions` requires the Casbin **scope `hotl:decide`** (not a path-based fallback rule). The scope is added to `tenant_admin` and `operator` roles in migration 0027; ordinary chat users receive `403 Forbidden`. The sprint-11 path-based rule (`p, *, /v1/hotl/decisions, POST`) is removed in the same migration.
+
+3. **Schema split.** Migration **0027** introduces `hotl_escalations` as the parent table — one row per top-level invocation (a single agent loop iteration that triggered HotL) — and refactors the sprint-11 `hotl_pending` into the child table with a `escalation_id` foreign key. A multi-gate iteration (one tool call gated under `tool_call.execute_python` and again under a nested `mcp.oauth.consent` from inside that call) now produces one `hotl_escalations` row plus N `hotl_pending` children, instead of N orphaned `hotl_pending` rows that all share a session id and have no traceable parent. The migration backfills existing `hotl_pending` rows into the new parent table 1-to-1 (each existing row gets its own parent), preserving lifecycle history without forensic loss.
+
+**Rationale:** The alias shim was a sprint-12 expediency; it leaves a two-name surface for an identifier that the contract calls one thing in prose. A clean rename is a small, contained breaking change at a moment where the SSE contract still has very few external integrators (chat-ui is the only consumer in tree). Path-based Casbin rules are pre-RBAC-redesign sediment — every other write-endpoint already uses scope rules, and leaving `POST /v1/hotl/decisions` on the path-based path is exactly the kind of inconsistency that produces the wrong-default-policy bug later. The single-table schema modelled one row per `(tenant, scope)` decision; the production cases for nested gating (orchestrator + per-peer HotL, DEC-021 triangle + Worker tool calls) require a parent dimension that the schema does not currently express. Adding it now is cheaper than retrofitting later through every aggregation query.
+
+**Refines:** DEC-006 (HotL — finishes the contract cleanups outstanding from sprint-12), DEC-008 (RLS double-layer — extends to `hotl_escalations`), DEC-021 (triangle topology — nested gating now has a parent record), R.E.S.T Security (scope rule) + Traceability (parent table) + Reliability (single-name surface eliminates one class of bug).
+
+**Migration risk:** Migration 0027 is the largest of the four sprint-13 items (parent-table backfill plus column rename across two tables). It is forward-only per GR-DB-02; pre-flight runs in `migrations-smoke` against a snapshot containing live `hotl_pending` rows. Rollback is via a forward-only `0028_revert` if the snapshot test fails — not by reversing 0027.
+
 ---
 
 ## 4. Runtime model
@@ -653,7 +713,7 @@ artifact:
   status: draft
   owners: [engineering.xiaoguai, architecture.xiaoguai]
   created_at: 2026-05-28
-  updated_at: 2026-05-28
+  updated_at: 2026-05-31
   source_documents:
     - PRD-XIAOGUAI-001
     - API-XIAOGUAI-001
@@ -675,6 +735,10 @@ entities:
     - { id: DEC-HLD-010, title: "Outcomes daily-bucketed reads", statement: "Outcome reads aggregated by day, tenant-scoped.", status: approved, scope: in, decision: "Daily bucket + tenant-scoped.", rationale: "Prevent cross-tenant inference." }
     - { id: DEC-HLD-011, title: "Orchestrator is multi-agent dispatch", statement: "xiaoguai-orchestrator coordinates peer agents.", status: approved, scope: in, decision: "Multi-agent dispatch + coordination.", rationale: "Demand observed; not a workflow engine." }
     - { id: DEC-HLD-012, title: "Personas are role presets", statement: "xiaoguai-personas stores presets and persona-scoped memory view.", status: approved, scope: in, decision: "Presets + memory.persona_id column.", rationale: "Matches existing schema and HANDOFF answer." }
+    - { id: DEC-HLD-013, title: "DecisionRegistry is PG-backed with boot replay", statement: "hotl_pending rows back the in-memory waiter map; on xiaoguai-api boot, pending+unexpired rows reattach in-process oneshot senders and re-arm per-row sleep_until timeouts.", status: approved, scope: in, decision: "PG row durability + in-process oneshot delivery; no Redis pub/sub.", rationale: "Restarts must not synthesise verdict=timeout when the operator already approved; keeps single-binary air-gap deployment intact." }
+    - { id: DEC-HLD-014, title: "HotL args redaction is policy-driven before SSE emission", statement: "Per-tenant hotl_redaction_policies declares JSONPath selectors masked to ***; redaction is mandatory and lives in xiaoguai-auth alongside Casbin.", status: approved, scope: in, decision: "Policy-driven redaction in xiaoguai-auth; no opt-out flag.", rationale: "Operator-visible banners are downstream of audit and telemetry redaction backstops; per-tenant rules let domains declare what is sensitive without hard-coded patterns." }
+    - { id: DEC-HLD-015, title: "HotL timeouts are per-scope class with default fallback", statement: "agent.hotl.expiry.<class> map (tool/mcp/skill) overrides agent.hotl.default_expiry; HotlEnforcer.escalate looks up by first scope component.", status: approved, scope: in, decision: "Per-scope class config, fallback to global default.", rationale: "Tool-call escalations are acute (minutes); skill_author is async (overnight); mcp.oauth is even slower. Single window denies-by-timeout the slow ones or loiters the fast ones." }
+    - { id: DEC-HLD-016, title: "escalation_id rename + hotl:decide scope + hotl_escalations parent table", statement: "Migration 0027 renames request_id→escalation_id end-to-end, adds Casbin hotl:decide scope rule, and splits hotl_pending into hotl_escalations (parent, one per top-level invocation) + hotl_pending (child).", status: approved, scope: in, decision: "Clean breaking rename + parent/child schema + scope rule.", rationale: "Alias shim leaves a two-name surface; path-based Casbin rules are pre-RBAC sediment; nested gating from DEC-021 needs a parent dimension the single-table schema does not express." }
   flows:
     - { id: FLOW-CHAT-001, title: "Single-agent chat lifecycle", statement: "User message flows through Auth → Casbin → ReAct loop → HotL gate → tool dispatch → SSE final.", status: approved, scope: in, kind: system_flow }
     - { id: FLOW-MULTI-001, title: "Multi-agent orchestration", statement: "Orchestrator dispatches to planner/researcher/critic peers, aggregates results.", status: approved, scope: in, kind: system_flow }
@@ -694,6 +758,13 @@ relations:
   - { id: REL-HLD-011, type: refines, from: FLOW-CHAT-001, to: REQ-CHAT-001, status: active }
   - { id: REL-HLD-012, type: refines, from: FLOW-MULTI-001, to: REQ-CHAT-004, status: active }
   - { id: REL-HLD-013, type: refines, from: FLOW-CANCEL-001, to: REQ-CHAT-002, status: active }
+  - { id: REL-HLD-014, type: refines, from: DEC-HLD-013, to: DEC-HLD-006, status: active }
+  - { id: REL-HLD-015, type: refines, from: DEC-HLD-014, to: DEC-HLD-006, status: active }
+  - { id: REL-HLD-016, type: refines, from: DEC-HLD-015, to: DEC-HLD-006, status: active }
+  - { id: REL-HLD-017, type: refines, from: DEC-HLD-016, to: DEC-HLD-006, status: active }
+  - { id: REL-HLD-018, type: refines, from: DEC-HLD-014, to: DEC-HLD-004, status: active }
+  - { id: REL-HLD-019, type: refines, from: DEC-HLD-013, to: DEC-HLD-008, status: active }
+  - { id: REL-HLD-020, type: refines, from: DEC-HLD-016, to: DEC-HLD-008, status: active }
 waivers: []
 ```
 <!-- TRACEABILITY-METADATA:END -->
