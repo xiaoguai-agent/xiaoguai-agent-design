@@ -314,7 +314,7 @@ impl DecisionRegistry {
 
 ### 4.6 HotL hardening (sprint-13)
 
-> **Status:** new section added in sprint-13 design pass. Refines §4.5 in four directions: registry persistence (DEC-HLD-013), policy-driven args redaction (DEC-HLD-014), per-scope timeouts (DEC-HLD-015), and the `escalation_id` rename + parent-table split (DEC-HLD-016). The §4.5 in-iteration suspension model is unchanged; this section specifies what changes around it.
+> **Status:** ✅ shipped in sprint-13 (xiaoguai PRs #139, #141, #144, #145, #146, #147, #148, #142, #143, #149). Section retained for the design rationale. Refines §4.5 in four directions: registry persistence (DEC-HLD-013), policy-driven args redaction (DEC-HLD-014), per-scope timeouts (DEC-HLD-015), and the `escalation_id` rename + parent-table split (DEC-HLD-016). The §4.5 in-iteration suspension model is unchanged; this section specifies what changes around it.
 
 **Identifier rename.** Everywhere in `xiaoguai-agent` and the cross-crate wire — `HotlGateVerdict::Suspend { request_id, ... }`, `AgentEvent::HotlPending { request_id, ... }`, `AgentEvent::HotlResolved { request_id, ... }`, `DecisionRegistry::register(request_id)`, `DecisionRegistry::resolve(request_id, ...)` — the field is renamed to `escalation_id`. The `#[serde(alias)]` shim is removed. SSE consumers that previously accepted both names now see only `escalation_id`. The new authoritative type is:
 

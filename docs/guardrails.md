@@ -56,8 +56,8 @@ Guardrails are **project-level engineering rules** that downstream documents (LL
 | GR-SEC-10 | `cargo audit` (advisory DB) MUST be clean on every PR; ignored advisories are documented in `deny.toml` with an expiry. | `audit.yml` workflow |
 | GR-SEC-11 | `cargo vet` trust list reviewed quarterly; new crate dependencies require a vet entry. | `cargo-vet.yml` workflow |
 | GR-SEC-12 | OWASP A01–A10 self-check applied to every new HTTP route at code-review time. | `security-review` skill or PR template checkbox |
-| GR-SEC-13 | HotL `args_redacted` MUST be computed by `xiaoguai-auth::redaction::RedactionRules::apply` before any SSE emission or audit row write. Direct copies of raw tool-call args into `AgentEvent::HotlPending` are forbidden. (DEC-HLD-014) | Clippy lint on `xiaoguai-agent` + integration test in `xiaoguai-core/tests/hotl_args_redaction.rs` |
-| GR-SEC-14 | `POST /v1/hotl/decisions` MUST be guarded by the Casbin scope `hotl:decide`. Path-based fallback rules for this route are forbidden. (DEC-HLD-016) | Migration 0027 asserts removal of path-based rule; integration test in `xiaoguai-api/tests/hotl_decide_scope.rs` |
+| GR-SEC-13 | HotL `args_redacted` MUST be computed by `xiaoguai-auth::redaction::RedactionRules::apply` before any SSE emission or audit row write. Direct copies of raw tool-call args into `AgentEvent::HotlPending` are forbidden. (DEC-HLD-014) | PR #148 + test in `crates/xiaoguai-core/tests/hotl_args_redaction.rs` |
+| GR-SEC-14 | `POST /v1/hotl/decisions` MUST be guarded by the Casbin scope `hotl:decide`. Path-based fallback rules for this route are forbidden. (DEC-HLD-016) | PR #143 + test in `crates/xiaoguai-api/tests/hotl_decide_scope.rs` |
 
 ### 3.1 Redaction policy (HotL operator-visibility surface)
 
@@ -75,6 +75,8 @@ DEC-HLD-014 introduces per-tenant redaction policies in table `hotl_redaction_po
 Policy evaluation lives in `xiaoguai-auth::redaction` alongside Casbin (see DEC-HLD-014 rationale for crate choice). The rule layer is mandatory on the emission path: `SuspendingHotlGate` cannot bypass `RedactionRules::apply` — there is no operator opt-out. An empty rule set degrades to "args verbatim + boot warning" so tenants are not silently exposed.
 
 Operators MUST configure at least one `applies_to=["sse"]` policy per tenant before flipping `agent.hotl.suspend_on_escalate = true`. The boot-time warning is GR-SEC-13's failure surface; the runbook references this paragraph.
+
+> **Shipped:** xiaoguai PR #144 (`xiaoguai-auth::redaction::RedactionRules` + `HotlRedactionRepo` wiring), PR #148 (`SuspendingHotlGate` applies `RedactionRules` before SSE/audit emission), PR #138 (migration 0027 introduces `redaction_policies` table).
 
 ---
 

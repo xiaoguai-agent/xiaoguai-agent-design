@@ -37,8 +37,8 @@ impl Storage {
     pub fn messages(&self) -> MessageRepo<'_>;
     pub fn memories(&self) -> MemoryRepo<'_>;
     pub fn hotl(&self) -> HotlPolicyRepo<'_>;
-    pub fn hotl_escalations(&self) -> HotlEscalationRepo<'_>;   // sprint-13 (DEC-HLD-013, DEC-HLD-016)
-    pub fn hotl_redaction(&self) -> HotlRedactionRepo<'_>;      // sprint-13 (DEC-HLD-014)
+    pub fn hotl_escalations(&self) -> HotlEscalationRepo<'_>;   // sprint-13 (DEC-HLD-013, DEC-HLD-016); shipped in xiaoguai PR #141
+    pub fn hotl_redaction(&self) -> HotlRedactionRepo<'_>;      // sprint-13 (DEC-HLD-014); shipped in xiaoguai PR #140
     pub fn audit(&self) -> AuditWriter<'_>;
     pub fn llm_providers(&self) -> ProviderRepo<'_>;
     pub fn token_usage(&self) -> TokenUsageRepo<'_>;
@@ -86,7 +86,8 @@ crates/xiaoguai-storage/
 │   └── 0027_hotl_escalations_split.sql # sprint-13 (DEC-HLD-016): hotl_escalations parent,
 │                                       # hotl_pending child FK, hotl_redaction_policies,
 │                                       # casbin hotl:decide rule + path-based-rule removal,
-│                                       # backfill existing hotl_pending rows 1-to-1 into parents
+│                                       # backfill existing hotl_pending rows 1-to-1 into parents;
+│                                       # shipped in xiaoguai PR #138
 └── tests/
     ├── rls_isolation.rs     # adversarial cross-tenant tests
     └── recall_hnsw.rs       # pgvector index correctness

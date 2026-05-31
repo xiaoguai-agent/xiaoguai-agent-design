@@ -245,6 +245,8 @@ Each job has at most one trigger plus one or more push sinks.
 
 Operator verdicts on escalated tool calls. Sprint-11 (S11-3a.1) shipped the **record-only** path; sprint-12 (S11-3a.2) flipped the `resumed` field to dynamic when a suspended agent loop is waiting. Sprint-13 (DEC-HLD-016) finishes the contract cleanup: the canonical identifier is `escalation_id` end-to-end, authorisation is the dedicated Casbin scope `hotl:decide`, and `escalation_id` references the `hotl_escalations` parent row introduced by migration 0027.
 
+> **Shipped:** xiaoguai PR #146 (backend `escalation_id` rename end-to-end), PR #147 (chat-ui rename), PR #143 (Casbin `hotl:decide` scope + DB-backed policy merge), PR #138 (migration 0027 — `hotl_escalations` parent + `redaction_policies` + Casbin row).
+
 Request:
 
 ```json
@@ -300,6 +302,8 @@ Status codes:
 #### 2.6.3 SSE events — `hotl_pending` and `hotl_resolved`
 
 Two SSE event variants on the chat message stream (`POST /v1/sessions/{id}/messages`, `Accept: text/event-stream`). Both are sprint-12 additions; sprint-11 has neither (the agent loop does not suspend — see [`lld-agent.md`](lld/lld-agent.md) §4.5). Sprint-13 renames the identifier field from `request_id` to `escalation_id` end-to-end (DEC-HLD-016) — the alias is removed.
+
+> **Shipped:** xiaoguai PR #146 (`AgentEvent::HotlPending` / `HotlResolved` rename + SSE field rename), PR #147 (chat-ui `HotlBanner` state keyed by `escalation_id`).
 
 `hotl_pending` — emitted by `xiaoguai-agent` when `HotlGate::check` returns `Suspend`:
 
