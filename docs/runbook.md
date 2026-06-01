@@ -320,6 +320,116 @@ kubectl -n xiaoguai rollout restart deploy/xiaoguai
 
 Switching modes loses in-process state (rate limit windows, session locks). This is by design — ephemeral state is not persisted.
 
+### 9.8 Provision OIDC `scopes` claim for HotL operators (sprint-14 — DEC-HLD-019, GR-SEC-17)
+
+`xiaoguai-api` enforces `hotl:decide` (and sprint-14's `hotl:policy:{read,write}`) by reading the JWT `scopes` claim. Most OIDC issuers do **not** emit a `scopes` claim by default — they emit `groups` or `roles`. This step makes the production issuer emit `scopes` so the extractor (DEC-HLD-018) sees the values it expects. Skipping this step manifests as `403 scope_required` on every `POST /v1/hotl/decisions`.
+
+**Verification.** First confirm what your tokens currently carry:
+
+```bash
+TOKEN=$(curl -s -X POST "$OIDC_ISSUER/token" \
+  -d grant_type=password -d username="$OPERATOR_USER" -d password="$OPERATOR_PASS" \
+  -d client_id="$XIAOGUAI_CLIENT_ID" | jq -r .access_token)
+
+# Decode the payload:
+echo "$TOKEN" | cut -d. -f2 | base64 -d 2>/dev/null | jq '.scopes // .scope // "ABSENT"'
+
+# Or hit /v1/me and look at the parsed scope list:
+curl -sH "Authorization: Bearer $TOKEN" "$XIAOGUAI_URL/v1/me" | jq '.scopes'
+```
+
+If the field reads `"ABSENT"` or `[]`, apply one of the per-issuer recipes below.
+
+#### Keycloak (recommended for self-hosted)
+
+```bash
+# Create a client scope named `xiaoguai-hotl` with a hard-coded scope mapper.
+kcadm.sh create client-scopes -r xiaoguai -s name=xiaoguai-hotl -s protocol=openid-connect
+SCOPE_ID=$(kcadm.sh get client-scopes -r xiaoguai -q name=xiaoguai-hotl --fields id -F json | jq -r '.[0].id')
+
+# Add a `hardcoded-claim` mapper producing the scopes claim as a JSON array.
+kcadm.sh create client-scopes/$SCOPE_ID/protocol-mappers/models -r xiaoguai \
+  -s name=hotl-scopes -s protocol=openid-connect \
+  -s protocolMapper=oidc-hardcoded-claim-mapper \
+  -s 'config."claim.name"=scopes' \
+  -s 'config."claim.value"=["hotl:decide","hotl:policy:read","hotl:policy:write"]' \
+  -s 'config."jsonType.label"=JSON' \
+  -s 'config."id.token.claim"=false' \
+  -s 'config."access.token.claim"=true'
+
+# Attach the scope to the xiaoguai client as default.
+kcadm.sh update clients/$XIAOGUAI_CLIENT_DBID/default-client-scopes/$SCOPE_ID -r xiaoguai
+```
+
+Restrict the scope assignment to the `operator` and `tenant_admin` realm-roles via a role-conditional client-scope (Keycloak 22+ feature) or use a script mapper that reads `realm_access.roles` and emits only the matching scope subset.
+
+#### Auth0 (Actions API)
+
+In the Auth0 dashboard, add a Post-Login Action:
+
+```javascript
+exports.onExecutePostLogin = async (event, api) => {
+  const roles = (event.authorization?.roles ?? []);
+  const scopes = [];
+  if (roles.includes('operator') || roles.includes('tenant_admin'))
+    scopes.push('hotl:decide');
+  if (roles.includes('tenant_admin') || roles.includes('operator'))
+    scopes.push('hotl:policy:read', 'hotl:policy:write');
+  if (scopes.length)
+    api.accessToken.setCustomClaim('scopes', scopes);
+};
+```
+
+Deploy → assign Action to the Login flow → next operator login carries the claim.
+
+#### Okta (Custom Authorization Server)
+
+Create a custom claim in the authorization server (Security → API → Authorization Servers → Default → Claims):
+
+| Field | Value |
+|---|---|
+| Name | `scopes` |
+| Include in token type | `Access Token` |
+| Value type | `Expression` |
+| Value | `Arrays.flatten(Arrays.filter(Groups.startsWith("xiaoguai:hotl:", 0, 100), {String g: g.substring(15)}))` |
+
+This maps Okta groups named `xiaoguai:hotl:<scope>` (e.g. `xiaoguai:hotl:decide`) to the `scopes` claim. Create the groups, assign operator users to them, and the next token carries the values.
+
+#### Azure AD / Entra ID
+
+Azure does not natively emit `scopes` from groups. Use a Conditional Access app role mapping:
+
+1. App registrations → xiaoguai → App roles → add `hotl-decide`, `hotl-policy-read`, `hotl-policy-write`.
+2. Enterprise applications → xiaoguai → Users and groups → assign operators to the `hotl-decide` role.
+3. Add a [Token Configuration](https://learn.microsoft.com/en-us/azure/active-directory/develop/optional-claims) optional claim of type `Optional Claim` named `scopes`, source `Application`, expression `roles` (the `roles` claim that Azure emits is then read by xiaoguai-api's claim parser as the `scopes` source — see `xiaoguai-auth::claims::parse_scopes` which accepts either `scopes` or `roles`).
+
+#### Authelia (self-hosted lightweight)
+
+In `configuration.yml`:
+
+```yaml
+identity_providers:
+  oidc:
+    clients:
+      - id: xiaoguai
+        scopes: [openid, profile, email, hotl:decide, hotl:policy:read, hotl:policy:write]
+        grant_types: [authorization_code, refresh_token]
+```
+
+Per-user scope assignment lives in `users_database.yml` under `groups:`; xiaoguai-api accepts `groups` as a fallback source when `scopes` is absent.
+
+#### Confirm the gauge
+
+After the issuer rollout:
+
+```bash
+# Should rise to ≥0.95 within 10 minutes of operator logins:
+curl -s "$XIAOGUAI_URL/metrics" | grep xiaoguai_oidc_scopes_claim_present
+# xiaoguai_oidc_scopes_claim_present{issuer="https://idp.example.com"} 1
+```
+
+If it stays at 0, the issuer is emitting tokens but the parser is not finding the claim — check `parse_scopes` log lines at boot for the field-name it looked for, and add the field-name to the issuer's claim configuration.
+
 ---
 
 ## 10. Scheduler operations

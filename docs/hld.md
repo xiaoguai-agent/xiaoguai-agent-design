@@ -472,6 +472,50 @@ Lookup order at `HotlEnforcer::escalate(scope, ...)`: split `scope` on `.`, take
 
 **Migration risk:** Migration 0027 is the largest of the four sprint-13 items (parent-table backfill plus column rename across two tables). It is forward-only per GR-DB-02; pre-flight runs in `migrations-smoke` against a snapshot containing live `hotl_pending` rows. Rollback is via a forward-only `0028_revert` if the snapshot test fails — not by reversing 0027.
 
+### DEC-030 — HotL redaction policies are tenant-managed CRUD with insert-only revisions (sprint-14)
+
+**Statement:** The `hotl_redaction_policies` table introduced in migration 0027 (DEC-027) graduates from operator-seeded YAML to a first-class CRUD surface owned by tenant admins. A new admin pane `/hotl-redaction-policies` (LLD-ADMIN-UI §4.11) is backed by REST routes `GET/POST/PUT/DELETE /v1/admin/hotl-redaction-policies` (api-contract §2.13). The PUT/DELETE shapes are **insert-only with an `active` flag** — every "edit" inserts a new row with a fresh `policy_id` and flips `active=false` on the prior revision; "delete" only sets `active=false`. The `redaction_policy_id` FK on `hotl_pending` audit rows (DEC-027) therefore continues to point at the exact revision that was applied at decision time, even after the policy is "changed". A `hotl_redaction_policy_revisions` view exposes lineage for the admin UI's history affordance.
+
+**Rationale:** Sprint-13 shipped the runtime path (S13-3 + S13-6) but left policy authoring as a `psql INSERT` task — unacceptable for production tenants whose security/compliance owners need to add a new `$.password`-style selector without engineer involvement. Insert-only over mutate-in-place is the audit-chain-friendly shape: if a tenant could rewrite a policy's JSONPath and have the new value resolve from an audit row's `redaction_policy_id`, the audit's "this is what the operator saw" promise breaks. The same insert-only pattern is already used for `signed_audit_keys` (DEC-004 HMAC rotation) — operators are familiar with the read-back-by-id-not-by-name idiom.
+
+**Refines:** DEC-027 (HotL redaction — adds the tenant-managed authoring surface), DEC-004 (audit chain — extends the insert-only-revision pattern), DEC-025 (frontend monorepo — new admin pane), R.E.S.T Security + Traceability dominant.
+
+**Concurrency:** Inserts use a `(tenant_id, scope, jsonpath, active=true)` unique partial index so a race between two admins editing the same `(scope, jsonpath)` resolves at the database — one INSERT succeeds, the other gets `409 Conflict` with a typed error pointing at the existing revision's `policy_id`. No application-level locking.
+
+**Audit:** Every CRUD mutation emits an audit row of kind `hotl_redaction_policy.{create,update,delete}` carrying both the old (nullable) and new (nullable) `policy_id` so compliance review can see "operator X changed `$.password` masking on tool `execute_python` at time T".
+
+### DEC-031 — Scope-gated routes share one `require_scope` axum extractor (sprint-14)
+
+**Statement:** The inline Casbin `hotl:decide` check landed by S13-10 in `routes/hotl_decisions.rs` is factored out into a reusable axum extractor `RequireScope("scope_name")` in a new module `xiaoguai-api::middleware::require_scope`. Routes that need scope gating compose the extractor declaratively in their handler signature:
+
+```rust
+async fn decide(
+    RequireScope(_): RequireScope<"hotl:decide">,
+    State(state): State<AppState>,
+    Json(body): Json<HotlDecisionRequest>,
+) -> Result<Json<HotlDecisionResponse>, ApiError> { … }
+```
+
+The extractor reads the `Claims` already populated by the JWT-validation layer (sprint-11), checks `claims.scopes.contains(scope)`, and on miss returns `403 Forbidden` with the canonical scope-error envelope (api-contract §1.6 `ErrorEnvelope { code: "scope_required", scope: "hotl:decide" }`) **before** the handler body runs. No DB round-trip — scopes are read off the JWT, not Casbin, because sprint-13's hybrid CSV+DB adapter feeds scopes into the token claims at issue time, not per-request.
+
+**Rationale:** S13-10 left the scope check inline as the narrowest possible diff. Sprint-14 queues at least two more scope-gated routes (`POST /v1/admin/hotl-redaction-policies` per DEC-030, `POST /v1/audit/exports/approve` per sprint-13 carry-forward) and reaches at least four if `skill-proposals` approve and `personas` write get scope-gated (currently role-gated). Four inline copies of the same `if !claims.scopes.contains(...) return 403` would diverge within a sprint; the extractor pattern keeps the gate at one site and makes the **route signature itself** the audit trail of what scope each endpoint requires. The choice of axum extractor over tower middleware is per existing convention — `RequireRole`, `RequireTenant` already exist as extractors (xiaoguai-api §3.2).
+
+**Refines:** DEC-029 (HotL `hotl:decide` scope — extracts the implementation as a primitive), DEC-008 (RLS double-layer — adds a third scope-claim layer on top, JWT-scoped), R.E.S.T Security dominant.
+
+**Hot-reload:** The Casbin DB merge that produces scope claims is still single-shot at boot (S13-10 limitation, sprint-13 carry-forward #1). Sprint-14 does **not** introduce hot-reload — admin-ui Casbin-rule edits still require a restart to take effect. The carry-forward is documented as a known gap; tenant rule churn is rare enough that a sprint-15 fix (SIGHUP or periodic re-merge) is the right shape, not a hot-reload extractor.
+
+### DEC-032 — Production JWT issuer must emit a `scopes` claim with `hotl:decide` for operator roles (sprint-14)
+
+**Statement:** Sprint-13's `hotl:decide` enforcement (DEC-029) is dev-validated by the `StubValidator` that mints whatever scopes the test fixture asks for. Production OIDC issuers (the operator's choice of Keycloak / Auth0 / Okta / Azure AD / Authelia) do **not** include a `scopes` claim by default — they emit `groups` or `roles`. This decision codifies the contract: any OIDC issuer used in front of `xiaoguai-api` MUST emit a `scopes` claim (RFC 8693-compatible space-separated string or JSON array) containing `hotl:decide` for the operator role. Runbook §9.8 ships per-issuer recipes (Keycloak client-scope template + Auth0 Action snippet) and a verification curl that hits `/v1/me` and confirms the parsed scope list contains the expected value.
+
+Until the production issuer is updated, operators get `403 Forbidden` on `POST /v1/hotl/decisions`. Dev/staging continues to work via `StubValidator`. This is a **deployment-time prerequisite**, not a backend code change — but it warrants an HLD entry because it is the missing piece between "ship sprint-13" and "production operators can actually approve escalations".
+
+**Rationale:** The sprint-13 handoff (carry-forward #2) flagged this as a coordination gap. Without an HLD entry, the recipe sits only in the runbook and the wrong assumption ("the JWT already has scopes — Casbin will be fine") propagates into deploy reviews. Anchoring the contract here makes scope-claim absence a **deploy-time CI gate** (boot-log diagnostic + a `xiaoguai_oidc_scopes_claim_present` gauge that alerts on the absence of any `scopes` claim across the last 100 verified tokens).
+
+**Refines:** DEC-029 (hotl:decide scope — operationalises the JWT side), DEC-031 (scope extractor — closes the loop: extractor reads the claim that this decision requires the issuer to emit), R.E.S.T Security + Reliability.
+
+**Observability:** New metric `xiaoguai_oidc_scopes_claim_present{issuer}` (gauge, set per token verification; 0 = absent, 1 = present). Alert fires when `avg_over_time(...[10m]) < 0.95` per issuer — catches a misconfigured issuer rolling out the wrong client scope.
+
 ---
 
 ## 4. Runtime model
@@ -739,6 +783,9 @@ entities:
     - { id: DEC-HLD-014, title: "HotL args redaction is policy-driven before SSE emission", statement: "Per-tenant hotl_redaction_policies declares JSONPath selectors masked to ***; redaction is mandatory and lives in xiaoguai-auth alongside Casbin.", status: approved, scope: in, decision: "Policy-driven redaction in xiaoguai-auth; no opt-out flag.", rationale: "Operator-visible banners are downstream of audit and telemetry redaction backstops; per-tenant rules let domains declare what is sensitive without hard-coded patterns." }
     - { id: DEC-HLD-015, title: "HotL timeouts are per-scope class with default fallback", statement: "agent.hotl.expiry.<class> map (tool/mcp/skill) overrides agent.hotl.default_expiry; HotlEnforcer.escalate looks up by first scope component.", status: approved, scope: in, decision: "Per-scope class config, fallback to global default.", rationale: "Tool-call escalations are acute (minutes); skill_author is async (overnight); mcp.oauth is even slower. Single window denies-by-timeout the slow ones or loiters the fast ones." }
     - { id: DEC-HLD-016, title: "escalation_id rename + hotl:decide scope + hotl_escalations parent table", statement: "Migration 0027 renames request_id→escalation_id end-to-end, adds Casbin hotl:decide scope rule, and splits hotl_pending into hotl_escalations (parent, one per top-level invocation) + hotl_pending (child).", status: approved, scope: in, decision: "Clean breaking rename + parent/child schema + scope rule.", rationale: "Alias shim leaves a two-name surface; path-based Casbin rules are pre-RBAC sediment; nested gating from DEC-021 needs a parent dimension the single-table schema does not express." }
+    - { id: DEC-HLD-017, title: "HotL redaction policies are tenant-managed CRUD with insert-only revisions", statement: "Admin pane + /v1/admin/hotl-redaction-policies routes own hotl_redaction_policies; every edit inserts a new revision and flips active=false on the prior; delete only sets active=false so audit rows pointing at a historical policy_id remain verifiable.", status: approved, scope: in, decision: "Insert-only revisions with active flag; tenant admins author via UI.", rationale: "Sprint-13 left policy authoring as psql INSERT; mutate-in-place breaks the audit-chain promise that the operator saw exactly the redaction recorded against the decision's redaction_policy_id." }
+    - { id: DEC-HLD-018, title: "Scope-gated routes share one require_scope axum extractor", statement: "Inline hotl:decide check from S13-10 is factored into RequireScope<&str> axum extractor reading from JWT Claims; new scope-gated routes (DEC-HLD-017 and audit-exports approve) reuse it.", status: approved, scope: in, decision: "Single extractor; no per-route inline check; no DB round-trip.", rationale: "Four inline copies of the same check would diverge within a sprint; route signatures become the authoritative audit trail of which scope each endpoint requires." }
+    - { id: DEC-HLD-019, title: "Production JWT issuer must emit scopes claim with hotl:decide for operator roles", statement: "Any OIDC issuer fronting xiaoguai-api MUST emit a scopes claim containing hotl:decide for operator roles; deploy-time prerequisite documented in runbook §9.8 with per-issuer recipes and a curl verification.", status: approved, scope: in, decision: "Contract requirement on the issuer; gauge alerts on absence.", rationale: "Sprint-13 enforcement is dev-validated by StubValidator; production OIDC issuers do not include scopes by default and emit groups/roles. Without an HLD entry, scope-claim absence remains a silent deploy-time foot-gun." }
   flows:
     - { id: FLOW-CHAT-001, title: "Single-agent chat lifecycle", statement: "User message flows through Auth → Casbin → ReAct loop → HotL gate → tool dispatch → SSE final.", status: approved, scope: in, kind: system_flow }
     - { id: FLOW-MULTI-001, title: "Multi-agent orchestration", statement: "Orchestrator dispatches to planner/researcher/critic peers, aggregates results.", status: approved, scope: in, kind: system_flow }
@@ -765,6 +812,11 @@ relations:
   - { id: REL-HLD-018, type: refines, from: DEC-HLD-014, to: DEC-HLD-004, status: active }
   - { id: REL-HLD-019, type: refines, from: DEC-HLD-013, to: DEC-HLD-008, status: active }
   - { id: REL-HLD-020, type: refines, from: DEC-HLD-016, to: DEC-HLD-008, status: active }
+  - { id: REL-HLD-021, type: refines, from: DEC-HLD-017, to: DEC-HLD-014, status: active }
+  - { id: REL-HLD-022, type: refines, from: DEC-HLD-017, to: DEC-HLD-004, status: active }
+  - { id: REL-HLD-023, type: refines, from: DEC-HLD-018, to: DEC-HLD-016, status: active }
+  - { id: REL-HLD-024, type: refines, from: DEC-HLD-019, to: DEC-HLD-016, status: active }
+  - { id: REL-HLD-025, type: refines, from: DEC-HLD-019, to: DEC-HLD-018, status: active }
 waivers: []
 ```
 <!-- TRACEABILITY-METADATA:END -->

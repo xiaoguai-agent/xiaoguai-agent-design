@@ -74,7 +74,7 @@ All non-2xx responses use this shape:
 |---|---|
 | 400 | `invalid_request`, `validation_failed` |
 | 401 | `unauthenticated`, `invalid_token` |
-| 403 | `forbidden`, `tenant_mismatch`, `policy_unavailable` |
+| 403 | `forbidden`, `tenant_mismatch`, `policy_unavailable`, `scope_required` (sprint-14 — DEC-HLD-018; carries `details.scope` naming the required scope claim) |
 | 404 | `not_found` |
 | 409 | `conflict`, `optimistic_lock_failed` |
 | 413 | `payload_too_large` |
@@ -295,8 +295,8 @@ Status codes:
 | `400 Bad Request` | Body uses legacy `request_id` field (sprint-13 rename; see DEC-HLD-016); or `escalation_id` malformed. Response carries `{"error":"field","field":"escalation_id","message":"..."}`. |
 | `401 Unauthorized` | Bearer missing or invalid. |
 | `403 Forbidden` | Caller's Casbin scopes do not include `hotl:decide` (sprint-13: the sprint-11 path-based fallback `p, *, /v1/hotl/decisions, POST` is removed by migration 0027). Granted by the `tenant_admin` and `operator` roles. |
-| `404 Not Found` | Unknown `escalation_id` — no row in `hotl_escalations` for this tenant. Sprint-12 added the parent table; sprint-13's migration 0027 makes it the authoritative parent for `hotl_pending` children, so 404 now means the parent does not exist (not merely that no pending row matches). |
-| `409 Conflict` | Duplicate decision for the same `escalation_id`. Operators must inspect the existing record. |
+| `404 Not Found` | Unknown `escalation_id` — no row in `hotl_escalations` for this tenant. Sprint-12 added the parent table; sprint-13's migration 0027 makes it the authoritative parent for `hotl_pending` children, so 404 now means the parent does not exist (not merely that no pending row matches). **Sprint-14 (DEC-LLD-AGENT-007):** the sprint-13 back-compat path of returning `201` + `resumed=false` for an unknown id is removed; the route now hard-distinguishes 404 from 409 based on parent presence + terminal state. |
+| `409 Conflict` | Duplicate decision for the same `escalation_id`. Operators must inspect the existing record. **Sprint-14:** also returned when the escalation parent exists but is already terminal (resolved or expired); the response body carries `existing_decision_id` so the operator can click through to the prior record. |
 | `503 Service Unavailable` | `HotlEscalationStore` not wired in production `AppState` (should not occur post-sprint-13; DEC-HLD-013 makes the PG impl the default). |
 
 #### 2.6.3 SSE events — `hotl_pending` and `hotl_resolved`
@@ -447,6 +447,52 @@ Response includes `install_id` and `effective_signature` (the signature actually
 |---|---|---|---|
 | `GET` | `/v1/usage` | Token usage aggregation, paginated and filterable by `(provider_id, model, user_id, session_id, from, to)` | REQ-LLM-005 |
 
+### 2.13 HotL redaction policies (sprint-14 — DEC-HLD-017)
+
+Tenant-admin CRUD for the `hotl_redaction_policies` table seeded in sprint-13's migration 0027. Companion to the runtime path documented in §2.6.3 (`HotlPending.args_redacted` field). PUT and DELETE follow the **insert-only revision** contract — see DEC-HLD-017: edits create a new `policy_id` and deactivate the prior; "delete" sets `active=false`. Audit rows pointing at a prior `policy_id` remain resolvable through `GET /{policy_id}/revisions`.
+
+| Method | Path | Description | Scope |
+|---|---|---|---|
+| `GET` | `/v1/admin/hotl-redaction-policies` | List policies for caller's tenant. Query: `?scope=&active=true|false|all` (default `active=true`). | `hotl:policy:read` |
+| `POST` | `/v1/admin/hotl-redaction-policies` | Create a new policy. Body: `{scope, jsonpath, applies_to}`. Returns `201` + the new row. | `hotl:policy:write` |
+| `GET` | `/v1/admin/hotl-redaction-policies/{policy_id}` | Read a single policy by id (active or historical). | `hotl:policy:read` |
+| `PUT` | `/v1/admin/hotl-redaction-policies/{policy_id}` | Insert a new revision superseding `policy_id`. Body: `{scope, jsonpath, applies_to}`. Returns `201` + new row carrying `supersedes_policy_id: <prior>`. The prior row is now `active=false`. | `hotl:policy:write` |
+| `DELETE` | `/v1/admin/hotl-redaction-policies/{policy_id}` | Deactivate (sets `active=false`). No row is removed; `GET` with `?active=false` continues to return it. | `hotl:policy:write` |
+| `GET` | `/v1/admin/hotl-redaction-policies/{policy_id}/revisions` | Lineage of a policy (reverse-chronological supersedes chain). Both inactive and active rows. | `hotl:policy:read` |
+
+#### 2.13.1 Policy shape
+
+```json
+{
+  "policy_id": "uuid",
+  "tenant_id": "uuid",
+  "scope": "tool_call.execute_python",   // matches HotL scope; `*` is the all-tools wildcard
+  "jsonpath": "$.password",              // JSONPath; values matched are replaced with the sentinel "***"
+  "applies_to": "emit",                  // "emit" | "audit" | "both" — which sink the policy guards
+  "active": true,
+  "supersedes_policy_id": null,          // non-null on rows created by PUT
+  "created_at": "2026-06-02T08:12:34Z",
+  "created_by": "ops@acme.com"
+}
+```
+
+#### 2.13.2 Status codes
+
+| Code | When |
+|---|---|
+| `200 OK` | `GET` (single + list + revisions). |
+| `201 Created` | `POST` or `PUT` (PUT creates a new revision row, not a mutation). |
+| `204 No Content` | `DELETE` (deactivation). |
+| `400 Bad Request` | Invalid `jsonpath` (parse error). Response carries `{"code":"invalid_jsonpath","detail":"<parse error + offset>"}`. |
+| `403 Forbidden` | Caller's scopes lack `hotl:policy:read` or `hotl:policy:write`. Enforced by the sprint-14 `RequireScope` extractor (DEC-HLD-018). |
+| `404 Not Found` | `policy_id` does not exist in caller's tenant (RLS-scoped). |
+| `409 Conflict` | (a) `POST` of an identical `(scope, jsonpath, active=true)` tuple — response carries `existing_policy_id`. (b) `DELETE` of the only active policy for a scope class when the tenant has `redaction_policy_required=true` (DEC-HLD-014 fail-closed mode). |
+| `503 Service Unavailable` | `HotlRedactionRepo` not wired in production `AppState`. |
+
+#### 2.13.3 Audit
+
+Every state-changing operation (`POST`, `PUT`, `DELETE`) emits an audit row of kind `hotl_redaction_policy.{create,update,delete}` with `{old_policy_id, new_policy_id, actor, scope, jsonpath}` so compliance review can reconstruct the policy timeline against the audit chain (DEC-HLD-004 + DEC-HLD-017).
+
 ---
 
 ## 3. MCP tool surface
@@ -545,11 +591,21 @@ Reference scopes:
 | Scope | Routes |
 |---|---|
 | `chat` | `/v1/sessions/**`, `/v1/memories/**`, `/v1/skills/installed`, `/v1/skills/install`, `/v1/workspaces/**` (self), `/v1/outcomes` (self) |
-| `tenant_admin` | All of `chat`, plus `/v1/hotl/policies/**`, `/v1/skills/catalog`, `/v1/mcp/servers`, `/v1/mcp/marketplace/**`, `/v1/admin/scheduler/**` (own tenant) |
-| `operator` | All of `tenant_admin`, plus `/v1/admin/tenants`, `/v1/admin/audit/**`, `/v1/admin/eval/**`, `/v1/admin/today`, `/v1/admin/casbin/**` |
+| `tenant_admin` | All of `chat`, plus `/v1/hotl/policies/**`, `/v1/skills/catalog`, `/v1/mcp/servers`, `/v1/mcp/marketplace/**`, `/v1/admin/scheduler/**` (own tenant), `/v1/admin/hotl-redaction-policies/**` (own tenant; via `hotl:policy:read`/`hotl:policy:write` claims) |
+| `operator` | All of `tenant_admin`, plus `/v1/admin/tenants`, `/v1/admin/audit/**`, `/v1/admin/eval/**`, `/v1/admin/today`, `/v1/admin/casbin/**`, `/v1/hotl/decisions` (via `hotl:decide` claim — DEC-HLD-016 / DEC-HLD-018) |
 | `scheduler_webhook` | `/v1/scheduler/webhooks/{route_id}` (X-Xiaoguai-Token, not JWT) |
 
 Cross-tenant operator views are gated by Casbin and audited separately.
+
+**Scope claims (sprint-14 — DEC-HLD-018, DEC-HLD-019).** Certain routes require a specific entry in the JWT's `scopes` claim, enforced by the `RequireScope` axum extractor before the role-based Casbin gate runs. Today's set:
+
+| Scope claim | Required by |
+|---|---|
+| `hotl:decide` | `POST /v1/hotl/decisions` |
+| `hotl:policy:read` | `GET /v1/admin/hotl-redaction-policies/**` |
+| `hotl:policy:write` | `POST/PUT/DELETE /v1/admin/hotl-redaction-policies/**` |
+
+OIDC issuers fronting `xiaoguai-api` must emit these scopes for the relevant roles; recipes live in [`runbook.md`](runbook.md) §9.8. Absence of the claim is observable via `xiaoguai_oidc_scopes_claim_present{issuer}` gauge (DEC-HLD-019).
 
 ---
 
