@@ -386,7 +386,91 @@ The `default_expiry` field stays in `HotlConfig` as the documented fallback (DEC
 
 **Test design** — see §7's "Integration" row: sprint-13 adds `hotl_persistence_replay.rs` (5 pending rows survive a simulated restart and resolve correctly), `hotl_args_redaction.rs` (password field masked before SSE emit), `hotl_per_scope_expiry.rs` (mcp.* scope picks 4h over default 24h), `hotl_escalation_id_rename.rs` (regression — old `request_id` payload rejected with 400), `hotl_decide_scope.rs` (operator without `hotl:decide` scope gets 403).
 
-## 5. Error handling
+### 4.7 API scope-gate extractor (sprint-14 — DEC-HLD-018)
+
+Sprint-13's S13-10 wired the `hotl:decide` Casbin scope into `POST /v1/hotl/decisions` as an inline check inside the route body. Sprint-14 extracts the check into a reusable axum extractor — a precondition for adding the same gate to the new `/v1/admin/hotl-redaction-policies` routes (DEC-HLD-017) and the queued `POST /v1/audit/exports/approve` route. The extractor lives in a new module `crates/xiaoguai-api/src/middleware/require_scope.rs`:
+
+```rust
+// xiaoguai-api::middleware::require_scope
+pub struct RequireScope<const SCOPE: &'static str>(pub Claims);
+
+#[async_trait]
+impl<const SCOPE: &'static str, S> FromRequestParts<S> for RequireScope<SCOPE>
+where
+    S: Send + Sync,
+    AppState: FromRef<S>,
+{
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let claims = Claims::from_request_parts(parts, state).await?;     // sprint-11 JWT layer
+        if !claims.scopes.iter().any(|s| s == SCOPE) {
+            return Err(ApiError::scope_required(SCOPE));                  // 403 with ErrorEnvelope.code = "scope_required"
+        }
+        Ok(RequireScope(claims))
+    }
+}
+```
+
+Handler composition becomes:
+
+```rust
+async fn decide(
+    RequireScope(claims): RequireScope<"hotl:decide">,
+    State(state): State<AppState>,
+    Json(body): Json<HotlDecisionRequest>,
+) -> Result<Json<HotlDecisionResponse>, ApiError> {
+    // claims.sub is the operator user_id; can thread through to record_decision when sprint-14
+    // S14-? graduates from request-body decided_by (sprint-13 carry-forward #6).
+    …
+}
+```
+
+**Why an extractor, not tower middleware.** axum extractors compose with the handler signature and surface in the route's type, so the scope requirement is part of the OpenAPI generation surface and `cargo doc`. A tower layer would route-attach the gate at router-construction time, which is one layer of indirection away from the handler. The existing `RequireRole<&'static str>` and `RequireTenant` extractors set the precedent.
+
+**Why JWT claims, not Casbin per-request.** The hybrid CSV+DB Casbin adapter from sprint-13's S13-10 merges policy at boot. Scopes for a role are stable for the lifetime of a token; reading them off the verified JWT is one in-memory `Vec::contains` rather than a DB round-trip per request. The trade-off is hot-reload: admin-ui rule edits don't take effect until the issuer re-mints tokens. Sprint-14 explicitly defers hot-reload (DEC-HLD-018 "Hot-reload" subsection); the carry-forward to sprint-15 is a SIGHUP-driven re-merge plus a token-revocation list.
+
+**Existing inline check.** `routes/hotl_decisions.rs` after sprint-13 has roughly:
+
+```rust
+async fn decide(State(state): State<AppState>, claims: Claims, Json(body): Json<…>) -> … {
+    if !claims.scopes.contains(&"hotl:decide".to_string()) {
+        return Err(ApiError::Forbidden);
+    }
+    …
+}
+```
+
+Sprint-14 migrates this to `RequireScope<"hotl:decide">` in the same PR that lands the extractor — the route's signature changes but the behaviour is byte-identical (same 403 status, same error envelope code).
+
+**Test design** — see §7's "Integration" row: sprint-14 adds `require_scope_extractor.rs` covering: (a) operator with scope passes; (b) operator without scope gets 403 with `ErrorEnvelope.code = "scope_required"` and `scope: "hotl:decide"`; (c) anonymous request gets 401 (auth layer runs first); (d) two different scope-gated routes in the same router compile and route correctly (regression for the `const SCOPE` parameter).
+
+### 4.8 Small carry-forwards from sprint-13 (sprint-14 — same PR series)
+
+Two sprint-13 deferrals are small enough to land in sprint-14 alongside the DEC-030/031/032 work; both touch §4.5 and §4.6 surfaces and reuse the same test fixtures.
+
+**Unknown escalation → 404.** S13-5 currently degrades `POST /v1/hotl/decisions` to `resumed=false` for unknown `escalation_id` (back-compat with sprint-12 routes that returned 200 + a flag). Sprint-13's parent-table presence assertion (DEC-HLD-016) now lets the route hard-distinguish "unknown id" from "known but already resolved/expired":
+
+```rust
+match store.lookup_parent(escalation_id).await? {
+    None => Err(ApiError::not_found("escalation_id"))   // 404 — id never existed
+    Some(row) if row.is_terminal() => Err(ApiError::conflict("escalation already resolved"))   // 409
+    Some(_) => /* proceed to in-process oneshot delivery */
+}
+```
+
+The `resumed=false` flag is removed from the response shape; chat-ui's HotlBanner already treats absent flag as "live". This is a breaking change in the response envelope; the chat-ui rename PR (sprint-13 S13-9) is the only known consumer.
+
+**Replay batch cap.** S13-5's boot replay is unbounded — `list_pending_unexpired` reads every row matching the filter. For tenants accumulating thousands of pending escalations (R13-4 in sprint-13 plan), this is one big query + one big DashMap insertion at boot. Sprint-14 introduces a cap with cursor-based pagination:
+
+```rust
+pub trait HotlEscalationStore {
+    async fn list_pending_unexpired_page(&self, cursor: Option<EscalationCursor>, limit: usize)
+        -> Result<(Vec<HotlPendingRow>, Option<EscalationCursor>), StorageError>;
+}
+```
+
+`run_serve` calls in a loop until the cursor returns `None`, yielding to the tokio runtime between pages so the HTTP server can start accepting traffic on the first page (subsequent pages replay in background). Default page size: 256 rows. Configurable via `agent.hotl.replay_page_size`. The total replayed count metric stays unchanged — the per-page invocation just increments incrementally.
 
 ```rust
 pub enum AgentError {
@@ -411,7 +495,7 @@ pub enum AgentError {
 | Layer | Cases |
 |---|---|
 | Unit | `react.rs` state machine: one-shot reply, multi-tool reply, escalated reply, cancelled reply. `history.rs` slide: noop_when_under_window, drops_oldest_non_system, drops_dangling_tool_message_at_new_head, window_zero_is_unbounded. `history.rs` compact: compact_noop_when_under_keep_recent, compact_replaces_head_with_summary, compact_falls_back_to_slide_on_backend_error, compact_preserves_tool_pairing, should_compact_threshold. |
-| Integration | `hotl_escalate.rs` — exceeded budget yields synthetic result + audit row; `cancel.rs` — cancel mid-tool returns Final(cancelled) within slowest-tool-deadline. **`compaction_integration.rs`** (v0.5.4.1): `compaction_shrinks_large_history_via_summary` — 100-turn synthetic conversation with 30 tool-call cycles compacts to ≤ 50 % of `max_context_tokens`; `compaction_preserves_recent_turns_verbatim` — last 6 messages bit-identical post-compaction. **Sprint-12 (S11-3a.2)**: `hotl_suspend.rs` — gate returns Suspend → loop emits HotlPending → registry.resolve(Allow) → loop emits HotlResolved + dispatches tool; `hotl_suspend_timeout.rs` — ticket times out → HotlResolved(Timeout) + synthetic Deny ToolResult; `hotl_suspend_cancel.rs` — cancellation registry fires during ticket.await → Final(Cancelled), no HotlResolved emitted. **Sprint-13 (HotL hardening)**: `hotl_persistence_replay.rs` — 5 pending rows with mixed expiry survive an `AppState` rebuild; all 5 oneshot waiters reattach and a subsequent `POST /v1/hotl/decisions` resolves each; expired-on-replay rows synthesise verdict=timeout exactly once. `hotl_args_redaction.rs` — tool call with `{password: "x"}` arg under a tenant policy matching `$.password` emits `HotlPending.args_redacted = {password: "***"}`; audit row carries non-null `redaction_policy_id`. `hotl_per_scope_expiry.rs` — config sets `expiry.mcp = 4h`, default 24h; an `mcp.oauth.consent` escalation's `expires_at` is now+4h; a `tool_call.execute_python` escalation's `expires_at` is now+24h. `hotl_escalation_id_rename.rs` — `POST /v1/hotl/decisions` with body using legacy `request_id` field returns 400 with `field: escalation_id` discriminator error. `hotl_decide_scope.rs` — operator JWT without `hotl:decide` scope receives 403 on `POST /v1/hotl/decisions`. |
+| Integration | `hotl_escalate.rs` — exceeded budget yields synthetic result + audit row; `cancel.rs` — cancel mid-tool returns Final(cancelled) within slowest-tool-deadline. **`compaction_integration.rs`** (v0.5.4.1): `compaction_shrinks_large_history_via_summary` — 100-turn synthetic conversation with 30 tool-call cycles compacts to ≤ 50 % of `max_context_tokens`; `compaction_preserves_recent_turns_verbatim` — last 6 messages bit-identical post-compaction. **Sprint-12 (S11-3a.2)**: `hotl_suspend.rs` — gate returns Suspend → loop emits HotlPending → registry.resolve(Allow) → loop emits HotlResolved + dispatches tool; `hotl_suspend_timeout.rs` — ticket times out → HotlResolved(Timeout) + synthetic Deny ToolResult; `hotl_suspend_cancel.rs` — cancellation registry fires during ticket.await → Final(Cancelled), no HotlResolved emitted. **Sprint-13 (HotL hardening)**: `hotl_persistence_replay.rs` — 5 pending rows with mixed expiry survive an `AppState` rebuild; all 5 oneshot waiters reattach and a subsequent `POST /v1/hotl/decisions` resolves each; expired-on-replay rows synthesise verdict=timeout exactly once. `hotl_args_redaction.rs` — tool call with `{password: "x"}` arg under a tenant policy matching `$.password` emits `HotlPending.args_redacted = {password: "***"}`; audit row carries non-null `redaction_policy_id`. `hotl_per_scope_expiry.rs` — config sets `expiry.mcp = 4h`, default 24h; an `mcp.oauth.consent` escalation's `expires_at` is now+4h; a `tool_call.execute_python` escalation's `expires_at` is now+24h. `hotl_escalation_id_rename.rs` — `POST /v1/hotl/decisions` with body using legacy `request_id` field returns 400 with `field: escalation_id` discriminator error. `hotl_decide_scope.rs` — operator JWT without `hotl:decide` scope receives 403 on `POST /v1/hotl/decisions`. **Sprint-14 (admin-CRUD + extractor)**: `require_scope_extractor.rs` — operator with `hotl:decide` passes through extractor; operator without it gets 403 + `code: "scope_required"`; anonymous request gets 401; two scope-gated routes coexist in one router. `hotl_redaction_policy_crud.rs` — create policy → escalation banner shows masked args; PUT creates new revision and old `policy_id` becomes inactive but audit row pointing at old id remains resolvable; DELETE only deactivates; 409 on concurrent identical inserts; 409 on deactivate-of-last-active-rule when `redaction_policy_required=true`. `hotl_unknown_escalation_404.rs` — decision on unknown id returns 404; decision on terminal id returns 409. `hotl_replay_pagination.rs` — 1000 pending rows replay across 4 pages of 256; HTTP server starts after page 1; first request served while pages 2-4 still replaying. |
 | System | Test strategy L2: SSE event sequence shape; BEH-CHAT-001. Compaction metrics: `xiaoguai_compaction_triggered_total` increments per trigger; `xiaoguai_compaction_fallback_total / triggered` < 5 % in healthy deployments. |
 
 ## 8. Traceability metadata
@@ -439,11 +523,15 @@ entities:
     - { id: DEC-LLD-AGENT-003, title: "Compaction deferred to Tier-2d", statement: "History compaction not implemented in v1.4.", status: approved, scope: in, decision: "Truncate-only for now.", rationale: "Compaction policy design is open (PRD Q5)." }
     - { id: DEC-LLD-AGENT-004, title: "HotL suspension is in-iteration, not a new state machine", statement: "On HotlGateVerdict::Suspend the loop blocks within the existing iteration on a HotlSuspensionTicket (oneshot receiver + timeout) before dispatching tools, rather than lifting suspension to an outer state machine.", status: approved, scope: in, decision: "In-iteration await.", rationale: "Sessions are already serialised (one loop per session, §6); a separate state machine would re-derive the per-tool-call locality the loop already owns. Cancellation registry already covers the ‘operator never decides + user closes tab’ case via a select between ticket.await and cancel.observe()." }
     - { id: DEC-LLD-AGENT-005, title: "HotL hardening — persistence + redaction + per-scope expiry + escalation_id rename", statement: "DecisionRegistry depends on HotlEscalationStore for boot-time replay; SuspendingHotlGate resolves RedactionRules from xiaoguai-auth before emitting HotlPending; expiry lookup is per-scope-class with default fallback; all wire fields rename request_id→escalation_id (no alias).", status: approved, scope: in, decision: "PG-backed registry + policy-driven redaction in xiaoguai-auth + per-scope expiry config + clean rename.", rationale: "Sprint-12 MVP loses live waiters on restart, leaks raw args to operators, uses one timeout for fundamentally different scope cadences, and carries a two-name surface for one identifier. Sprint-13 closes all four in one cohesive hardening pass." }
+    - { id: DEC-LLD-AGENT-006, title: "Scope-gate enforcement is a reusable axum extractor reading JWT claims", statement: "xiaoguai-api::middleware::require_scope::RequireScope<&'static str> extracts the operator scope from the verified JWT claims and short-circuits with 403 + ErrorEnvelope.code='scope_required' before the handler runs; sprint-13's inline check in routes/hotl_decisions.rs migrates to the extractor.", status: approved, scope: in, decision: "axum extractor over tower middleware; const-generic scope name; JWT claims, not Casbin per-request.", rationale: "Sprint-14 queues at least two more scope-gated routes; inline copies would diverge within a sprint; the extractor surfaces the scope requirement in the handler signature for OpenAPI + cargo doc visibility. JWT claims avoid per-request DB round-trips, accepting the hot-reload trade-off (deferred to sprint-15)." }
+    - { id: DEC-LLD-AGENT-007, title: "Sprint-13 carry-forwards bundled into sprint-14 (unknown escalation 404, replay batch pagination)", statement: "POST /v1/hotl/decisions returns 404 on unknown escalation_id and 409 on terminal escalation_id (removing the resumed=false flag); boot replay paginates pending+unexpired rows with a configurable page size (default 256) and starts the HTTP server after page 1 with subsequent pages replaying in background.", status: approved, scope: in, decision: "Bundle two small sprint-13 carry-forwards alongside DEC-LLD-AGENT-006 so they share the same routes/storage diff review.", rationale: "Both touch §4.5/§4.6 surfaces and reuse the existing test fixtures; landing them with sprint-14 avoids a sprint-15 micro-PR series for changes that are individually too small to warrant their own sprint." }
   flows:
     - { id: FLOW-LLD-AGENT-001, title: "ReAct iteration with HotL", statement: "Stream LLM, gate tool calls, parallel dispatch, append history, loop or finalise.", status: approved, scope: in, kind: module_interaction }
     - { id: FLOW-LLD-AGENT-002, title: "Cancellation propagation", statement: "Registry poll at boundaries; bounded by slowest tool.", status: approved, scope: in, kind: state_transition }
     - { id: FLOW-LLD-AGENT-003, title: "HotL suspend/resume (sprint-12)", statement: "On Suspend verdict emit HotlPending, await DecisionRegistry ticket (or timeout), emit HotlResolved, then dispatch or synthesise failed ToolResult based on operator verdict.", status: approved, scope: in, kind: module_interaction }
     - { id: FLOW-LLD-AGENT-004, title: "HotL registry boot replay (sprint-13)", statement: "On AppState build, HotlEscalationStore.list_pending_unexpired drives per-row oneshot mint + sleep_until re-arm; HTTP server starts after replay completes.", status: approved, scope: in, kind: state_transition }
+    - { id: FLOW-LLD-AGENT-005, title: "RequireScope axum extractor (sprint-14)", statement: "FromRequestParts reads Claims (sprint-11 layer) → claims.scopes.contains(SCOPE) → on miss return 403 with ErrorEnvelope.code=scope_required + scope name; on hit yield Claims to handler.", status: approved, scope: in, kind: module_interaction }
+    - { id: FLOW-LLD-AGENT-006, title: "Paginated HotL registry boot replay (sprint-14)", statement: "list_pending_unexpired_page yields cursor-tagged pages of N rows; run_serve replays page 1 sync (HTTP server then accepts) and spawns a tokio task to drain remaining pages; per-page replay metrics increment incrementally.", status: approved, scope: in, kind: state_transition }
   test_cases: []
 relations:
   - { id: REL-LLD-AGENT-001, type: refines, from: DEC-LLD-AGENT-001, to: DEC-HLD-006, status: active }
@@ -454,6 +542,11 @@ relations:
   - { id: REL-LLD-AGENT-006, type: refines, from: DEC-LLD-AGENT-005, to: DEC-HLD-015, status: active }
   - { id: REL-LLD-AGENT-007, type: refines, from: DEC-LLD-AGENT-005, to: DEC-HLD-016, status: active }
   - { id: REL-LLD-AGENT-008, type: refines, from: FLOW-LLD-AGENT-004, to: DEC-HLD-013, status: active }
+  - { id: REL-LLD-AGENT-009, type: refines, from: DEC-LLD-AGENT-006, to: DEC-HLD-018, status: active }
+  - { id: REL-LLD-AGENT-010, type: refines, from: DEC-LLD-AGENT-006, to: DEC-HLD-016, status: active }
+  - { id: REL-LLD-AGENT-011, type: refines, from: FLOW-LLD-AGENT-005, to: DEC-HLD-018, status: active }
+  - { id: REL-LLD-AGENT-012, type: refines, from: DEC-LLD-AGENT-007, to: DEC-HLD-013, status: active }
+  - { id: REL-LLD-AGENT-013, type: refines, from: FLOW-LLD-AGENT-006, to: DEC-HLD-013, status: active }
 waivers: []
 ```
 <!-- TRACEABILITY-METADATA:END -->

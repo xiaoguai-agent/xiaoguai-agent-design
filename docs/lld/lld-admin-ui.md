@@ -163,6 +163,54 @@ Casbin scopes the backend enforces (e.g. `audit.export`, `skill.approve`, `tenan
 
 The scope list is fetched once per session from a new `GET /v1/admin/me/scopes` endpoint (sprint-10b backend task). On absence (older backend), the gate fails open — render the child and let the backend enforce. This is **UX**, not security; the backend is the enforcement point (PHILO §17 "Bypassable compliance gates" anti-pattern).
 
+### 4.11 HotL Redaction Policies pane (sprint-14 NEW — DEC-HLD-017)
+
+Tenant admins author the JSONPath rules that mask sensitive tool-call arguments before they reach the operator banner (DEC-027 implementation, S13-3 + S13-6). Distinct from §4.4 "HotL Policies pane" — that pane edits **budget** rules (calls-per-hour); this one edits **redaction** rules (which fields get masked to `"***"`).
+
+Route: `/hotl-redaction-policies`. Pane composition:
+
+```
+┌─ HotlRedactionPoliciesPane ────────────────────────────────────────┐
+│ <FilterBar scope= [tool | mcp | skill | all] active={true|all} />  │
+│ <PolicyTable> rows mirror HotlRedactionPolicyView {                 │
+│   policy_id, scope, jsonpath, applies_to,                           │
+│   active, created_at, created_by, supersedes_policy_id?             │
+│ } …                                                                 │
+│   <RowActions> Edit | Deactivate | Test | View revisions            │
+│ </PolicyTable>                                                      │
+│ <CreatePolicyButton> → modal:                                       │
+│   • scope (text; e.g. `tool_call.execute_python` or wildcard `*`)   │
+│   • jsonpath (`<JsonPathInput>` with live syntax validation)        │
+│   • applies_to: emit | audit | both                                 │
+│   • dry-run tester: paste JSON arg → live preview of masked output  │
+│ <RevisionsModal policy_id={X}> → reverse-chronological list of      │
+│   supersedes_policy_id chain; read-only.                            │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+CRUD wiring (api-contract §2.13):
+
+| Action | Method + path | Body | Scope |
+|---|---|---|---|
+| List | `GET /v1/admin/hotl-redaction-policies?scope=&active=` | — | `hotl:policy:read` |
+| Create | `POST /v1/admin/hotl-redaction-policies` | `{scope, jsonpath, applies_to}` | `hotl:policy:write` |
+| Edit (insert-only) | `PUT /v1/admin/hotl-redaction-policies/{policy_id}` | `{scope, jsonpath, applies_to}` | `hotl:policy:write` |
+| Deactivate | `DELETE /v1/admin/hotl-redaction-policies/{policy_id}` | — | `hotl:policy:write` |
+| Revisions | `GET /v1/admin/hotl-redaction-policies/{policy_id}/revisions` | — | `hotl:policy:read` |
+
+PUT is **insert-only**: the response body returns a new `policy_id` and the prior id's `active` becomes `false`. The pane reflects this by closing the edit modal with a toast "policy revised — old revision now inactive (id: …)" and refreshing the table. Audit chain references the exact `policy_id` that was applied at decision time (DEC-027 FK + DEC-HLD-017 insert-only contract).
+
+Failure modes:
+
+| Failure | Source | UX |
+|---|---|---|
+| Invalid JSONPath (parse error) | Backend `400` (api-contract `ErrorEnvelope.code = "invalid_jsonpath"`) | Modal stays open; field-level error pointing at the JSONPath input with the parse error's character offset. |
+| Concurrent edit (DEC-HLD-017 unique partial index) | Backend `409 Conflict` carrying `existing_policy_id` | Modal stays open with banner: "Another admin (user X) added an identical rule at T. View revision N (link) or amend yours." |
+| Deactivate cascade unsafe | Backend `409` if the policy is the only active rule for a scope-class with mandatory redaction (sprint-14 carry from DEC-027's "mandatory on emission path" — empty rule set degrades to warn but `redaction_policy_required=true` config flips it to hard-deny) | Modal: "Cannot deactivate — this is the only active redaction rule for scope `tool_call.*` and the tenant has `redaction_policy_required=true`. Create a replacement first." |
+| Dry-run tester JSONPath parse fail (client-side) | `@xiaoguai/shared::parseJsonPath` returns Err | Inline message under the JSONPath input; submit button disabled. |
+
+Scope gate (DEC-LLD-ADMIN-UI-002 + DEC-HLD-018): the pane and CreatePolicyButton are wrapped in `<RequireScope name="hotl:policy:write">`. Read-only view (only `hotl:policy:read`) hides the action column but shows the table. Operators without either scope see the standard `<RequireScope>` Forbidden copy.
+
 ### 4.9 i18n + a11y
 
 `react-i18next` with `zh-Hans` + `en` bundles. All visible strings go through `t()`; aria labels and screen-reader-only headings are in the same bundles. The lint rule (`@xiaoguai/admin-ui` ESLint config) forbids string literals in JSX children outside `t()` (sprint-10b will introduce). Color tokens use `prefers-color-scheme`; dark mode is the default (matches operator workflow).
@@ -207,9 +255,9 @@ Top-level `<ErrorBoundary>` in `App.tsx` catches render-time exceptions (compone
 
 | Layer | Cases |
 |---|---|
-| Unit (Vitest) | Pane render contracts: Loading / Error / Ready / Empty for each of the 16 panes (existing 14 + Personas + SkillProposals); `XiaoguaiClient` error union narrowing; `<RequireScope>` open-fail behaviour; i18n key coverage (all visible strings have zh-Hans + en); `<ChainBadge>` colour decision matrix on Audit pane. |
-| Component (Vitest + React Testing Library) | `Anomaly.test.ts`, `Kanban.test.ts`, `SkillPacks.test.ts`, `HotlPolicies.test.ts`, `Memory.test.ts` — exist. Sprint-10b adds `Personas.test.ts`, `SkillProposals.test.ts`, `Audit.test.ts` (chain badge + export modal). |
-| E2E (Playwright `@xiaoguai/e2e`) | Existing: `e2e/tests/admin-ui/golden-path.spec.ts` (173 LOC; covers Today → Audit → Scheduler smoke). Sprint-10b adds: `admin-personas.spec.ts`, `admin-skill-proposals.spec.ts`, `admin-audit-export.spec.ts` (HMAC chain → export → ChainProof download). Multi-browser matrix (Chrome / Firefox / Safari) per existing `playwright.config.ts:19-108`. |
+| Unit (Vitest) | Pane render contracts: Loading / Error / Ready / Empty for each of the 17 panes (existing 14 + Personas + SkillProposals + sprint-14 HotlRedactionPolicies); `XiaoguaiClient` error union narrowing; `<RequireScope>` open-fail behaviour; i18n key coverage (all visible strings have zh-Hans + en); `<ChainBadge>` colour decision matrix on Audit pane; `<JsonPathInput>` syntax validator (sprint-14, isolated component) covers ≥ 10 invalid-input cases. |
+| Component (Vitest + React Testing Library) | `Anomaly.test.ts`, `Kanban.test.ts`, `SkillPacks.test.ts`, `HotlPolicies.test.ts`, `Memory.test.ts` — exist. Sprint-10b adds `Personas.test.ts`, `SkillProposals.test.ts`, `Audit.test.ts` (chain badge + export modal). Sprint-14 adds `HotlRedactionPolicies.test.ts` covering: list render with scope filter, create modal happy path, edit-creates-new-revision toast, 409-conflict UX, deactivate-cascade-blocked UX, dry-run masking preview. |
+| E2E (Playwright `@xiaoguai/e2e`) | Existing: `e2e/tests/admin-ui/golden-path.spec.ts` (173 LOC; covers Today → Audit → Scheduler smoke). Sprint-10b adds: `admin-personas.spec.ts`, `admin-skill-proposals.spec.ts`, `admin-audit-export.spec.ts` (HMAC chain → export → ChainProof download). Sprint-14 adds `admin-hotl-redaction-policies.spec.ts`: create policy → trigger HotL escalation in chat-ui → verify banner shows `"***"` for the configured JSONPath → edit policy → verify new banner reflects updated mask → verify old audit row still references the prior `policy_id`. Multi-browser matrix per existing `playwright.config.ts:19-108`. |
 | Accessibility | Axe-core integrated in Playwright on the same golden paths (sprint-10b adds); fail on serious/critical violations. |
 
 ## 8. Traceability metadata
@@ -235,13 +283,17 @@ entities:
     - { id: DEC-LLD-ADMIN-UI-001, title: "Pane-local state, no global store", statement: "Each pane owns its state via useState/useReducer. No Redux/Zustand. Cross-pane state lives in the URL.", status: approved, scope: in, decision: "Local state.", rationale: "14+ pane SPA; global store invites cross-feature coupling. URL as state is browser-native." }
     - { id: DEC-LLD-ADMIN-UI-002, title: "RBAC scope gate is UX, backend enforces", statement: "<RequireScope> hides actions when scope is absent; fails open when /me/scopes is unavailable. Backend Casbin is the enforcement point.", status: approved, scope: in, decision: "UX hint only.", rationale: "Frontend gates are bypassable; only backend gates are safe (PHILO §17)." }
     - { id: DEC-LLD-ADMIN-UI-003, title: "No login page in this SPA", statement: "Authentication is delegated to the surrounding reverse proxy / OIDC; SPA reads bearer from injected header. On 401 → redirect to VITE_LOGIN_URL.", status: approved, scope: in, decision: "Delegated auth.", rationale: "Air-gapped deployments use Kong / nginx / corporate SSO; one OIDC integration in the proxy, none in the SPA (DEC-025)." }
+    - { id: DEC-LLD-ADMIN-UI-004, title: "HotL Redaction Policies pane uses insert-only revision UX", statement: "Edit emits PUT that creates a new policy_id and toasts the supersedes lineage; delete is deactivate (active=false). Revisions modal shows the supersedes_policy_id chain read-only. Confirms DEC-HLD-017's audit-chain-friendly contract end-to-end through the UI.", status: approved, scope: in, decision: "Insert-only edits surfaced as a toast; deletes are deactivations.", rationale: "Mutate-in-place would orphan historical audit references; the pane must mirror the database's insert-only contract or operators will misunderstand what 'edit' means." }
   flows:
     - { id: FLOW-LLD-ADMIN-UI-001, title: "Pane lifecycle", statement: "Mount → loading → error|ready → mutation (optimistic + revert).", status: approved, scope: in, kind: module_interaction }
     - { id: FLOW-LLD-ADMIN-UI-002, title: "Audit chain visualisation", statement: "GET /v1/admin/audit → ChainBadge colouring → optional /v1/audit/exports flow.", status: approved, scope: in, kind: module_interaction }
+    - { id: FLOW-LLD-ADMIN-UI-003, title: "HotL redaction policy authoring", statement: "List → CreatePolicy (validate JSONPath) → POST → table refresh; Edit → PUT (returns new policy_id) → toast supersedes lineage; Deactivate → DELETE; Revisions modal walks supersedes_policy_id chain.", status: approved, scope: in, kind: module_interaction }
   test_cases: []
 relations:
   - { id: REL-LLD-ADMIN-UI-001, type: refines, from: DEC-LLD-ADMIN-UI-002, to: DEC-HLD-006, status: active }
   - { id: REL-LLD-ADMIN-UI-002, type: refines, from: FLOW-LLD-ADMIN-UI-002, to: DEC-HLD-004, status: active }
+  - { id: REL-LLD-ADMIN-UI-003, type: refines, from: DEC-LLD-ADMIN-UI-004, to: DEC-HLD-017, status: active }
+  - { id: REL-LLD-ADMIN-UI-004, type: refines, from: FLOW-LLD-ADMIN-UI-003, to: DEC-HLD-017, status: active }
 waivers: []
 ```
 <!-- TRACEABILITY-METADATA:END -->

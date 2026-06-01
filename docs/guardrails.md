@@ -58,6 +58,9 @@ Guardrails are **project-level engineering rules** that downstream documents (LL
 | GR-SEC-12 | OWASP A01–A10 self-check applied to every new HTTP route at code-review time. | `security-review` skill or PR template checkbox |
 | GR-SEC-13 | HotL `args_redacted` MUST be computed by `xiaoguai-auth::redaction::RedactionRules::apply` before any SSE emission or audit row write. Direct copies of raw tool-call args into `AgentEvent::HotlPending` are forbidden. (DEC-HLD-014) | PR #148 + test in `crates/xiaoguai-core/tests/hotl_args_redaction.rs` |
 | GR-SEC-14 | `POST /v1/hotl/decisions` MUST be guarded by the Casbin scope `hotl:decide`. Path-based fallback rules for this route are forbidden. (DEC-HLD-016) | PR #143 + test in `crates/xiaoguai-api/tests/hotl_decide_scope.rs` |
+| GR-SEC-15 | Every scope-gated HTTP route MUST express its scope requirement via the `xiaoguai-api::middleware::require_scope::RequireScope<&'static str>` axum extractor. Inline `if !claims.scopes.contains(...)` checks in route handlers are forbidden — the gate must surface in the handler signature so OpenAPI generation and `cargo doc` produce an authoritative scope-route map. (DEC-HLD-018) | Sprint-14 PR (tracked) + lint in `tools/lint-scope-gates.sh` grepping for the forbidden pattern + test `require_scope_extractor.rs` |
+| GR-SEC-16 | `hotl_redaction_policies` mutations are insert-only with an `active` flag. UPDATE statements on the table are forbidden in production code paths; only the migration toolchain (`xiaoguai-storage::migrations`) may run an UPDATE, and only to set `active=false` from a transactional code path that simultaneously inserts the superseding revision. (DEC-HLD-017) | Sprint-14 PR (tracked) + repo-grep CI gate forbidding `UPDATE hotl_redaction_policies` outside migrations + test in `crates/xiaoguai-storage/tests/hotl_redaction_revisions.rs` |
+| GR-SEC-17 | OIDC issuers fronting `xiaoguai-api` MUST emit a `scopes` claim containing at minimum `hotl:decide` for operator roles and `hotl:policy:{read,write}` for tenant-admin roles. Absence is observable via the `xiaoguai_oidc_scopes_claim_present{issuer}` gauge; alert fires when `avg_over_time(...[10m]) < 0.95`. (DEC-HLD-019) | Runbook §9.8 (issuer-specific recipes) + boot-log diagnostic for missing claim + Grafana alert in `observability/grafana/dashboards/xiaoguai-tenant.json` |
 
 ### 3.1 Redaction policy (HotL operator-visibility surface)
 
@@ -77,6 +80,24 @@ Policy evaluation lives in `xiaoguai-auth::redaction` alongside Casbin (see DEC-
 Operators MUST configure at least one `applies_to=["sse"]` policy per tenant before flipping `agent.hotl.suspend_on_escalate = true`. The boot-time warning is GR-SEC-13's failure surface; the runbook references this paragraph.
 
 > **Shipped:** xiaoguai PR #144 (`xiaoguai-auth::redaction::RedactionRules` + `HotlRedactionRepo` wiring), PR #148 (`SuspendingHotlGate` applies `RedactionRules` before SSE/audit emission), PR #138 (migration 0027 introduces `redaction_policies` table).
+
+### 3.2 Policy authoring surface (sprint-14 — DEC-HLD-017)
+
+Sprint-13 shipped the runtime path; sprint-14 adds the tenant-admin authoring surface. The CRUD contract (api-contract §2.13) is **insert-only with an `active` flag**:
+
+- `POST` inserts a new row.
+- `PUT` inserts a **new** row with `supersedes_policy_id = <prior>` and atomically flips the prior to `active=false` in the same transaction. The new row receives a fresh `policy_id`.
+- `DELETE` only sets `active=false` (the row stays for audit lineage).
+
+Audit rows in `hotl_pending` carry the exact `redaction_policy_id` that was applied at decision time (DEC-HLD-014); insert-only revisions preserve that pointer's resolvability for the life of the audit chain. GR-SEC-16 enforces the contract at the CI layer — any `UPDATE hotl_redaction_policies` outside the migration toolchain is a lint failure.
+
+> **Planned:** sprint-14 PR series — admin-ui pane (LLD-ADMIN-UI §4.11), backend repo + routes (api-contract §2.13), audit hooks for the mutations (`hotl_redaction_policy.{create,update,delete}` audit kinds).
+
+### 3.3 Scope-gate extractor and OIDC contract (sprint-14 — DEC-HLD-018, DEC-HLD-019)
+
+Sprint-13's S13-10 added a `hotl:decide` scope check inline in `routes/hotl_decisions.rs`. Sprint-14 extracts that check into a reusable axum extractor (`xiaoguai-api::middleware::require_scope::RequireScope<&'static str>`); GR-SEC-15 makes the extractor mandatory for every scope-gated route. The extractor reads from JWT claims, not Casbin per-request, accepting the hot-reload trade-off explicitly (DEC-HLD-018 "Hot-reload" subsection).
+
+The production deployment contract is GR-SEC-17: OIDC issuers must emit a `scopes` claim. Until they do, operators get `403 scope_required` on `POST /v1/hotl/decisions` (and any other scope-gated route). Runbook §9.8 documents per-issuer recipes (Keycloak / Auth0 / Okta / Azure AD / Authelia); the boot-log diagnostic surfaces the absence within 10 s of the first verified token.
 
 ---
 
